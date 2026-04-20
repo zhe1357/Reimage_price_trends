@@ -1,6 +1,18 @@
 name: cnn_311
 channels:
+  - pytorch
+  - conda-forge
   - defaults
 dependencies:
   - python=3.11
-prefix: C:\Users\user\miniconda3\envs\cnn_311
+  - numpy>=1.26,<2.0
+  - pandas>=2.2,<2.3
+  - scikit-learn>=1.4,<1.6
+  - matplotlib>=3.8,<3.11
+  - pyarrow>=15,<19
+  - pillow>=10,<12
+  - tqdm>=4.66,<5
+  - yfinance>=0.2.40,<0.3
+  - pytorch>=2.2,<2.6
+  - cpuonly
+  - ipykernel>=6.29,<7
