@@ -81,21 +81,19 @@ def _final_dataset_paths(dataset_dir: str) -> dict[str, str]:
 
 
 def _final_dataset_exists(dataset_dir: str) -> bool:
-    required = ["X_train", "y_train", "X_val", "y_val", "X_test", "y_test", "meta"]
+    required = ["X_trainval", "y_trainval", "X_test", "y_test", "meta"]
     paths = _final_dataset_paths(dataset_dir)
     return all(os.path.exists(paths[name]) for name in required)
 
 
 def _load_final_dataset(dataset_dir: str):
     paths = _final_dataset_paths(dataset_dir)
-    X_tr = np.load(paths["X_train"])
-    y_tr = np.load(paths["y_train"])
-    X_va = np.load(paths["X_val"])
-    y_va = np.load(paths["y_val"])
+    X_tv = np.load(paths["X_trainval"])
+    y_tv = np.load(paths["y_trainval"])
     X_te = np.load(paths["X_test"])
     y_te = np.load(paths["y_test"])
     meta_df = pd.read_csv(paths["meta"])
-    return X_tr, y_tr, X_va, y_va, X_te, y_te, meta_df
+    return X_tv, y_tv, X_te, y_te, meta_df
 
 
 def _save_feather_if_available(df: pd.DataFrame, path: str):
@@ -129,10 +127,8 @@ def _write_build_log(
     done_tickers,
     skipped_rows,
     dropped,
-    X_tr,
-    y_tr,
-    X_va,
-    y_va,
+    X_tv,
+    y_tv,
     X_te,
     y_te,
 ):
@@ -157,11 +153,9 @@ def _write_build_log(
         f"done_tickers: {len(done_tickers)}",
         f"skipped_tickers: {len(skipped_rows)}",
         f"boundary_overlap_dropped_samples: {dropped}",
-        f"train_samples: {len(X_tr)}",
-        f"val_samples: {len(X_va)}",
+        f"trainval_samples: {len(X_tv)}",
         f"test_samples: {len(X_te)}",
-        f"train_up_rate: {_safe_rate(y_tr):.6f}",
-        f"val_up_rate: {_safe_rate(y_va):.6f}",
+        f"trainval_up_rate: {_safe_rate(y_tv):.6f}",
         f"test_up_rate: {_safe_rate(y_te):.6f}",
         f"skip_reason_counts: {skip_counts}",
     ]
@@ -519,7 +513,7 @@ def build_research_dataset(
 
     Returns
     -------
-    X_train, y_train, X_val, y_val, X_test, y_test, meta_df
+    X_trainval, y_trainval, X_test, y_test, meta_df
     """
     if sample_step is None:
         sample_step = R
@@ -834,6 +828,51 @@ def build_research_dataset(
     X_te = X_all[test_indices];       y_te = y_all[test_indices]
     meta_test = meta_df.iloc[test_indices].reset_index(drop=True)
 
+    print(f"  Train+Val: {len(X_tv)}  (up={y_tv.mean():.3f})")
+    print(f"  Test     : {len(X_te)}  (up={y_te.mean():.3f})")
+
+    for name, arr in [
+        ("X_trainval", X_tv), ("y_trainval", y_tv),
+        ("X_test", X_te), ("y_test", y_te),
+    ]:
+        np.save(os.path.join(dataset_dir, f"{name}.npy"), arr)
+    meta_df.to_csv(os.path.join(dataset_dir, "meta.csv"), index=False)
+    meta_trainval = meta_df.iloc[train_val_indices].reset_index(drop=True)
+    meta_trainval.to_csv(os.path.join(dataset_dir, "meta_trainval.csv"), index=False)
+    meta_test.to_csv(os.path.join(dataset_dir, "meta_test.csv"), index=False)
+    _save_feather_if_available(meta_df, os.path.join(dataset_dir, "meta.feather"))
+    _save_feather_if_available(meta_trainval, os.path.join(dataset_dir, "meta_trainval.feather"))
+    _save_feather_if_available(meta_test, os.path.join(dataset_dir, "meta_test.feather"))
+    _save_sample_images(dataset_dir, X_all, meta_df, limit=sample_image_count)
+    _write_build_log(
+        dataset_dir=dataset_dir,
+        Market=Market,
+        start=start,
+        end=end,
+        train_end=train_end,
+        I=I,
+        R=R,
+        sample_step=sample_step,
+        price_source=price_source,
+        strict_time_split=strict_time_split,
+        max_workers=max_workers,
+        checkpoint_every=checkpoint_every,
+        checkpoint_save_arrays=checkpoint_save_arrays,
+        year_ticker_chunk_size=year_ticker_chunk_size,
+        process_by=process_by,
+        total_tickers=len(tickers),
+        done_tickers=done_tickers,
+        skipped_rows=skipped_rows,
+        dropped=dropped,
+        X_tv=X_tv,
+        y_tv=y_tv,
+        X_te=X_te,
+        y_te=y_te,
+    )
+
+    print(f"\n撌脣摮 {dataset_dir}/")
+    return X_tv, y_tv, X_te, y_te, meta_df
+
     print(f"Train+Val 樣本: {len(X_tv)} | Test 樣本: {len(X_te)}")
 
     # ── 修正 2：train/val 隨機切割（論文明確要求）───────────────────────────
@@ -967,6 +1006,43 @@ def make_dataloaders(X_tr, y_tr, X_va, y_va, X_te, y_te,
     test_loader  = DataLoader(test_ds,  batch_size=batch_size, shuffle=False, num_workers=num_workers)
 
     return train_loader, val_loader, test_loader
+
+
+def make_dataloaders_from_trainval(
+    X_trainval,
+    y_trainval,
+    X_test,
+    y_test,
+    val_ratio=0.3,
+    random_state=42,
+    batch_size=128,
+    num_workers=0,
+):
+    """Split trainval into train/val at training time, then build DataLoaders."""
+    indices = np.arange(len(X_trainval))
+    train_indices, val_indices = train_test_split(
+        indices,
+        test_size=val_ratio,
+        random_state=random_state,
+        shuffle=True,
+        stratify=y_trainval,
+    )
+
+    X_tr = X_trainval[train_indices]
+    y_tr = y_trainval[train_indices]
+    X_va = X_trainval[val_indices]
+    y_va = y_trainval[val_indices]
+
+    return make_dataloaders(
+        X_tr,
+        y_tr,
+        X_va,
+        y_va,
+        X_test,
+        y_test,
+        batch_size=batch_size,
+        num_workers=num_workers,
+    )
 
 
 # =========================================================
