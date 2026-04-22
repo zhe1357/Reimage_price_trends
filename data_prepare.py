@@ -1,3 +1,5 @@
+from __future__ import annotations
+
 import os
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
@@ -6,7 +8,13 @@ import pandas as pd
 from tqdm import tqdm
 from sklearn.model_selection import train_test_split
 
-from data_fetch import _download_single, get_crsp_trading_calendar, load_crsp_single, load_crsp_years
+from data_fetch import (
+    _download_single,
+    get_crsp_trading_calendar,
+    load_crsp_single,
+    load_crsp_years,
+    resolve_crsp_data_dir,
+)
 from image_builder import generate_research_image
 
 
@@ -34,9 +42,9 @@ def _save_build_checkpoint(
     os.makedirs(dataset_dir, exist_ok=True)
 
     if save_arrays and all_images:
-        np.save(paths["X"], np.stack(all_images).astype(np.uint8))
-        np.save(paths["y"], np.array(all_labels, dtype=np.int64))
-        pd.DataFrame(all_meta).to_csv(paths["meta"], index=False)
+        _atomic_save_npy(paths["X"], np.stack(all_images).astype(np.uint8))
+        _atomic_save_npy(paths["y"], np.array(all_labels, dtype=np.int64))
+        _atomic_save_csv(pd.DataFrame(all_meta), paths["meta"], index=False)
 
     with open(paths["done"], "w", encoding="utf-8") as f:
         for ticker in sorted(done_tickers):
@@ -68,6 +76,12 @@ def _load_build_checkpoint(dataset_dir, process_by="ticker"):
         all_images = [img for img in X_checkpoint]
         all_labels = y_checkpoint.astype(np.int64).tolist()
         all_meta = meta_checkpoint.to_dict("records")
+    elif done_tickers:
+        print(
+            "  Checkpoint done file exists, but checkpoint arrays/meta are missing. "
+            "Ignoring done markers and rebuilding to avoid an incomplete dataset."
+        )
+        done_tickers = set()
 
     return all_images, all_labels, all_meta, done_tickers
 
@@ -77,13 +91,38 @@ def _final_dataset_paths(dataset_dir: str) -> dict[str, str]:
     names.extend(["X_trainval", "y_trainval"])
     paths = {name: os.path.join(dataset_dir, f"{name}.npy") for name in names}
     paths["meta"] = os.path.join(dataset_dir, "meta.csv")
+    paths["meta_trainval"] = os.path.join(dataset_dir, "meta_trainval.csv")
+    paths["meta_test"] = os.path.join(dataset_dir, "meta_test.csv")
     return paths
 
 
 def _final_dataset_exists(dataset_dir: str) -> bool:
-    required = ["X_trainval", "y_trainval", "X_test", "y_test", "meta"]
+    required = [
+        "X_trainval",
+        "y_trainval",
+        "X_test",
+        "y_test",
+        "meta",
+        "meta_trainval",
+        "meta_test",
+    ]
     paths = _final_dataset_paths(dataset_dir)
-    return all(os.path.exists(paths[name]) for name in required)
+    if not all(os.path.exists(paths[name]) for name in required):
+        return False
+    try:
+        X_tv = np.load(paths["X_trainval"], mmap_mode="r")
+        y_tv = np.load(paths["y_trainval"], mmap_mode="r")
+        X_te = np.load(paths["X_test"], mmap_mode="r")
+        y_te = np.load(paths["y_test"], mmap_mode="r")
+        meta_trainval = pd.read_csv(paths["meta_trainval"])
+        meta_test = pd.read_csv(paths["meta_test"])
+    except Exception as exc:
+        print(f"Existing final dataset is not readable ({type(exc).__name__}: {exc})")
+        return False
+    return (
+        len(X_tv) == len(y_tv) == len(meta_trainval)
+        and len(X_te) == len(y_te) == len(meta_test)
+    )
 
 
 def _load_final_dataset(dataset_dir: str):
@@ -98,13 +137,47 @@ def _load_final_dataset(dataset_dir: str):
 
 def _save_feather_if_available(df: pd.DataFrame, path: str):
     try:
-        df.to_feather(path)
+        tmp_path = f"{path}.tmp"
+        df.to_feather(tmp_path)
+        os.replace(tmp_path, path)
     except Exception as exc:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except Exception:
+            pass
         print(f"  Feather not saved ({type(exc).__name__}: {exc})")
 
 
 def _safe_rate(y: np.ndarray) -> float:
     return float(np.mean(y)) if len(y) else float("nan")
+
+
+def _atomic_save_npy(path: str, arr: np.ndarray):
+    tmp_path = f"{path}.tmp"
+    try:
+        with open(tmp_path, "wb") as f:
+            np.save(f, arr)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        finally:
+            raise
+
+
+def _atomic_save_csv(df: pd.DataFrame, path: str, **kwargs):
+    tmp_path = f"{path}.tmp"
+    try:
+        df.to_csv(tmp_path, **kwargs)
+        os.replace(tmp_path, path)
+    except Exception:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        finally:
+            raise
 
 
 def _write_build_log(
@@ -116,6 +189,8 @@ def _write_build_log(
     I,
     R,
     sample_step,
+    sample_mode,
+    sample_freq,
     price_source,
     strict_time_split,
     max_workers,
@@ -142,6 +217,8 @@ def _write_build_log(
         f"I: {I}",
         f"R: {R}",
         f"sample_step: {sample_step}",
+        f"sample_mode: {sample_mode}",
+        f"sample_freq: {sample_freq}",
         f"price_source: {price_source}",
         f"strict_time_split: {strict_time_split}",
         f"max_workers: {max_workers}",
@@ -198,11 +275,17 @@ def get_dataset_output_dir(
     I: int,
     R: int,
     sample_step: int | None = None,
+    sample_mode: str | None = None,
+    sample_freq: str | None = None,
 ) -> str:
     """Return the organized output folder for one generated dataset."""
     if sample_step is None:
         sample_step = R
     tag = f"I{I}R{R}S{sample_step}"
+    if sample_mode is not None:
+        tag = f"{tag}_{sample_mode}"
+    if sample_freq is not None:
+        tag = f"{tag}_{sample_freq}"
     return os.path.join(save_dir, "training_data", Market, tag)
 
 
@@ -218,17 +301,71 @@ def _forward_return(df: pd.DataFrame, R: int, price_source: str) -> pd.Series:
     return df["close"].pct_change(R).shift(-R)
 
 
+def _infer_sample_freq(R: int) -> str:
+    if R == 5:
+        return "week"
+    if R == 20:
+        return "month"
+    if R in {60, 65}:
+        return "quarter"
+    raise ValueError("sample_freq must be provided when R is not 5, 20, 60, or 65")
+
+
+def _period_end_dates(dates: pd.Series, sample_freq: str) -> pd.DatetimeIndex:
+    """Return last available trading date in each week/month/quarter."""
+    if sample_freq not in {"week", "month", "quarter"}:
+        raise ValueError("sample_freq must be 'week', 'month', or 'quarter'")
+
+    date_index = pd.DatetimeIndex(pd.to_datetime(dates, errors="coerce").dropna())
+    date_index = date_index.drop_duplicates().sort_values()
+    if len(date_index) == 0:
+        return pd.DatetimeIndex([])
+
+    if sample_freq == "week":
+        period_key = date_index.to_period("W-FRI")
+    elif sample_freq == "month":
+        period_key = date_index.to_period("M")
+    else:
+        period_key = date_index.to_period("Q")
+
+    return pd.DatetimeIndex(pd.Series(date_index).groupby(period_key).max().to_numpy())
+
+
+def _candidate_end_indices(
+    df: pd.DataFrame,
+    I: int,
+    sample_step: int,
+    sample_mode: str,
+    sample_freq: str,
+) -> list[int]:
+    if sample_mode == "step":
+        return [i + I - 1 for i in range(0, len(df) - I + 1, sample_step)]
+    if sample_mode != "period_end":
+        raise ValueError("sample_mode must be 'period_end' or 'step'")
+
+    period_ends = set(_period_end_dates(df["date"], sample_freq))
+    dates = pd.to_datetime(df["date"], errors="coerce")
+    return [
+        idx for idx, date in enumerate(dates)
+        if idx >= I - 1 and pd.notna(date) and date in period_ends
+    ]
+
+
 def _build_ticker_samples_from_df(
     ticker,
     df,
     I,
     R,
     sample_step,
+    sample_mode,
+    sample_freq,
     price_source,
     trading_calendar=None,
     show_progress=False,
     target_start=None,
     target_end=None,
+    has_volume_bar=True,
+    ma_lags=None,
 ):
     ticker_key = str(ticker)
     images = []
@@ -277,13 +414,22 @@ def _build_ticker_samples_from_df(
 
     target_start = pd.to_datetime(target_start) if target_start is not None else None
     target_end = pd.to_datetime(target_end) if target_end is not None else None
-    iterator = range(0, len(df) - I + 1, sample_step)
+    candidate_end_indices = _candidate_end_indices(
+        df,
+        I=I,
+        sample_step=sample_step,
+        sample_mode=sample_mode,
+        sample_freq=sample_freq,
+    )
+    iterator = candidate_end_indices
     if show_progress:
         iterator = tqdm(iterator, desc=f"  build {ticker}")
 
-    for i in iterator:
-        window = df.iloc[i : i + I]
-        end_idx = i + I - 1
+    ma_offset = 0 if ma_lags is None else max([int(lag) for lag in ma_lags], default=0)
+    for end_idx in iterator:
+        i = end_idx - I + 1
+        history_start = max(first_valid_idx, i - ma_offset)
+        window = df.iloc[history_start : end_idx + 1]
 
         if i <= first_valid_idx or end_idx >= last_valid_idx:
             continue
@@ -303,7 +449,12 @@ def _build_ticker_samples_from_df(
         label_end_date = df.iloc[end_idx + R]["date"]
 
         try:
-            img = generate_research_image(window, I=I)
+            img = generate_research_image(
+                window,
+                I=I,
+                has_volume_bar=has_volume_bar,
+                ma_lags=ma_lags,
+            )
         except ValueError:
             continue
 
@@ -319,6 +470,8 @@ def _build_ticker_samples_from_df(
             "I": I,
             "R": R,
             "sample_step": sample_step,
+            "sample_mode": sample_mode,
+            "sample_freq": sample_freq,
             "price_source": price_source,
         })
 
@@ -332,11 +485,15 @@ def _build_one_ticker_samples(
     I,
     R,
     sample_step,
+    sample_mode,
+    sample_freq,
     price_source,
     crsp_data_dir,
     crsp_adjusted,
     trading_calendar=None,
     show_progress=False,
+    has_volume_bar=True,
+    ma_lags=None,
 ):
     ticker_key = str(ticker)
     images = []
@@ -362,9 +519,13 @@ def _build_one_ticker_samples(
         I=I,
         R=R,
         sample_step=sample_step,
+        sample_mode=sample_mode,
+        sample_freq=sample_freq,
         price_source=price_source,
         trading_calendar=trading_calendar,
         show_progress=show_progress,
+        has_volume_bar=has_volume_bar,
+        ma_lags=ma_lags,
     )
 
 
@@ -382,9 +543,13 @@ def _build_crsp_year_samples(
     I,
     R,
     sample_step,
+    sample_mode,
+    sample_freq,
     crsp_data_dir,
     crsp_adjusted,
     ticker_chunk_size=1000,
+    has_volume_bar=True,
+    ma_lags=None,
 ):
     year = int(year)
     unit_key = f"year:{year}"
@@ -447,11 +612,15 @@ def _build_crsp_year_samples(
                 I=I,
                 R=R,
                 sample_step=sample_step,
+                sample_mode=sample_mode,
+                sample_freq=sample_freq,
                 price_source="crsp",
                 trading_calendar=trading_calendar,
                 show_progress=False,
                 target_start=target_start,
                 target_end=target_end,
+                has_volume_bar=has_volume_bar,
+                ma_lags=ma_lags,
             )
             if warning:
                 skipped_rows.append({"ticker": ticker_key, "reason": f"{year}: {warning}"})
@@ -478,9 +647,13 @@ def build_research_dataset(
     random_state = 42,
     Market = "TW",
     sample_step = None,
+    sample_mode = "period_end",
+    sample_freq = None,
     price_source = "yfinance",
     crsp_data_dir = "us_stock_data",
     crsp_adjusted = True,
+    has_volume_bar = True,
+    ma_lags = None,
     strict_time_split = True,
     checkpoint_every = 0,
     resume = False,
@@ -517,17 +690,32 @@ def build_research_dataset(
     """
     if sample_step is None:
         sample_step = R
+    if sample_freq is None:
+        sample_freq = _infer_sample_freq(R)
+    if ma_lags is None:
+        ma_lags = [] if I == 5 else [I]
     if sample_step < 1:
         raise ValueError("sample_step must be >= 1")
+    if sample_mode not in {"period_end", "step"}:
+        raise ValueError("sample_mode must be 'period_end' or 'step'")
     if max_workers < 1:
         raise ValueError("max_workers must be >= 1")
     if process_by not in {"ticker", "year"}:
         raise ValueError("process_by must be 'ticker' or 'year'")
     if process_by == "year" and price_source != "crsp":
         raise ValueError("process_by='year' is currently only supported for price_source='crsp'")
+    if price_source == "crsp":
+        crsp_data_dir = resolve_crsp_data_dir(crsp_data_dir)
 
-    tag = f"I{I}R{R}S{sample_step}"
-    dataset_dir = get_dataset_output_dir(save_dir, Market, I, R, sample_step=sample_step)
+    dataset_dir = get_dataset_output_dir(
+        save_dir,
+        Market,
+        I,
+        R,
+        sample_step=sample_step,
+        sample_mode=sample_mode,
+        sample_freq=sample_freq,
+    )
     os.makedirs(dataset_dir, exist_ok=True)
 
     if load_existing and _final_dataset_exists(dataset_dir):
@@ -592,9 +780,13 @@ def build_research_dataset(
                 I=I,
                 R=R,
                 sample_step=sample_step,
+                sample_mode=sample_mode,
+                sample_freq=sample_freq,
                 crsp_data_dir=crsp_data_dir,
                 crsp_adjusted=crsp_adjusted,
                 ticker_chunk_size=year_ticker_chunk_size,
+                has_volume_bar=has_volume_bar,
+                ma_lags=ma_lags,
             )
             if warning:
                 print(f"  skip year {year}: {warning}")
@@ -623,11 +815,15 @@ def build_research_dataset(
                         I,
                         R,
                         sample_step,
+                        sample_mode,
+                        sample_freq,
                         price_source,
                         crsp_data_dir,
                         crsp_adjusted,
                         trading_calendar,
                         False,
+                        has_volume_bar,
+                        ma_lags,
                     ): ticker
                     for ticker in pending_tickers
                 }
@@ -665,11 +861,15 @@ def build_research_dataset(
                     I,
                     R,
                     sample_step,
+                    sample_mode,
+                    sample_freq,
                     price_source,
                     crsp_data_dir,
                     crsp_adjusted,
                     trading_calendar,
                     True,
+                    has_volume_bar,
+                    ma_lags,
                 )
             except Exception as exc:
                 ticker_key = str(ticker)
@@ -688,102 +888,6 @@ def build_research_dataset(
             _mark_ticker_done(ticker_key)
 
         pending_tickers = []
-
-    for ticker in pending_tickers:
-        ticker_key = str(ticker)
-        if ticker_key in done_tickers:
-            continue
-
-        print(f"\n[I{I}/R{R}] 處理: {ticker}")
-
-        if price_source == "yfinance":
-            df = _download_single(ticker, start, end)
-        elif price_source == "crsp":
-            df = load_crsp_single(
-                ticker,
-                start=start,
-                end=end,
-                crsp_data_dir=crsp_data_dir,
-                adjusted=crsp_adjusted,
-            )
-        else:
-            raise ValueError("price_source must be 'yfinance' or 'crsp'")
-        if df is None:
-            _mark_ticker_done(ticker_key)
-            print(f"  ⚠️  {ticker} 無資料，跳過")
-            continue
-
-        # 確認必要欄位
-        required = {"open", "high", "low", "close", "volume"}
-        missing  = required - set(df.columns)
-        if missing:
-            _mark_ticker_done(ticker_key)
-            print(f"  ⚠️  {ticker} 缺少欄位 {missing}，跳過")
-            continue
-
-        # ── 計算標籤（論文：forward R-day return）──────────────────────────
-        #   pct_change(R) 計算 t 到 t+R 的累積報酬
-        #   shift(-R) 讓第 t 行的值 = 從 t+1 開始的 R 天報酬
-        #   → df.iloc[i + I - 1]["label"] 代表圖像結束後的 R 天方向
-        df[f"ret{R}"] = _forward_return(df, R, price_source)
-        df["label"] = (df[f"ret{R}"] > 0).where(df[f"ret{R}"].notna(), np.nan)
-        valid_price_row = df[["open", "high", "low", "close", "volume"]].notna().any(axis=1)
-        valid_ret_row = df[f"ret{R}"].notna()
-        df = df.reset_index(drop=True)
-        valid_price_row = valid_price_row.reset_index(drop=True)
-        valid_ret_row = valid_ret_row.reset_index(drop=True)
-        valid_indices = np.flatnonzero(valid_price_row.to_numpy())
-        if len(valid_indices) == 0:
-            _mark_ticker_done(ticker_key)
-            print(f"  ⚠️  {ticker} 無有效價格資料，跳過")
-            continue
-        first_valid_idx = int(valid_indices[0])
-        last_valid_idx = int(valid_indices[-1])
-
-        if len(df) < I + R + 5:
-            _mark_ticker_done(ticker_key)
-            print(f"  ⚠️  {ticker} 有效資料不足，跳過")
-            continue
-
-        # ── 依預測天期週期生成圖像（預設每 R 個交易日取一張）────────────────
-        for i in tqdm(range(0, len(df) - I + 1, sample_step), desc=f"  生成圖像"):
-            window = df.iloc[i : i + I]
-
-            end_idx = i + I - 1
-            if i <= first_valid_idx or end_idx >= last_valid_idx:
-                continue
-            if not valid_ret_row.iloc[end_idx]:
-                continue
-            if end_idx + R >= len(df):
-                continue
-
-            # Image end date label: forward return after the image window.
-            label    = int(df.iloc[end_idx]["label"])
-            end_date = df.iloc[end_idx]["date"]
-            start_date = df.iloc[i]["date"]
-            label_end_date = df.iloc[end_idx + R]["date"]
-
-            try:
-                img = generate_research_image(window, I=I)
-            except ValueError:
-                continue
-
-            all_images.append(img)
-            all_labels.append(label)
-            all_meta.append({
-                "ticker" : ticker,
-                "start_date": start_date,
-                "date"   : end_date,
-                "label_end_date": label_end_date,
-                "label"  : label,
-                "ret"    : df.iloc[end_idx][f"ret{R}"],
-                "I"      : I,
-                "R"      : R,
-                "sample_step": sample_step,
-                "price_source": price_source,
-            })
-
-        _mark_ticker_done(ticker_key)
 
     if checkpoint_every:
         _save_build_checkpoint(
@@ -835,11 +939,11 @@ def build_research_dataset(
         ("X_trainval", X_tv), ("y_trainval", y_tv),
         ("X_test", X_te), ("y_test", y_te),
     ]:
-        np.save(os.path.join(dataset_dir, f"{name}.npy"), arr)
-    meta_df.to_csv(os.path.join(dataset_dir, "meta.csv"), index=False)
+        _atomic_save_npy(os.path.join(dataset_dir, f"{name}.npy"), arr)
+    _atomic_save_csv(meta_df, os.path.join(dataset_dir, "meta.csv"), index=False)
     meta_trainval = meta_df.iloc[train_val_indices].reset_index(drop=True)
-    meta_trainval.to_csv(os.path.join(dataset_dir, "meta_trainval.csv"), index=False)
-    meta_test.to_csv(os.path.join(dataset_dir, "meta_test.csv"), index=False)
+    _atomic_save_csv(meta_trainval, os.path.join(dataset_dir, "meta_trainval.csv"), index=False)
+    _atomic_save_csv(meta_test, os.path.join(dataset_dir, "meta_test.csv"), index=False)
     _save_feather_if_available(meta_df, os.path.join(dataset_dir, "meta.feather"))
     _save_feather_if_available(meta_trainval, os.path.join(dataset_dir, "meta_trainval.feather"))
     _save_feather_if_available(meta_test, os.path.join(dataset_dir, "meta_test.feather"))
@@ -853,6 +957,8 @@ def build_research_dataset(
         I=I,
         R=R,
         sample_step=sample_step,
+        sample_mode=sample_mode,
+        sample_freq=sample_freq,
         price_source=price_source,
         strict_time_split=strict_time_split,
         max_workers=max_workers,
@@ -872,80 +978,6 @@ def build_research_dataset(
 
     print(f"\n撌脣摮 {dataset_dir}/")
     return X_tv, y_tv, X_te, y_te, meta_df
-
-    print(f"Train+Val 樣本: {len(X_tv)} | Test 樣本: {len(X_te)}")
-
-    # ── 修正 2：train/val 隨機切割（論文明確要求）───────────────────────────
-    #   shuffle=True（預設）確保 up/down 標籤均衡分布到 train 與 val
-    tv_local_indices = np.arange(len(X_tv))
-    tr_local_indices, va_local_indices = train_test_split(
-        tv_local_indices,
-        test_size    = val_ratio,
-        random_state = random_state,
-        shuffle      = True,          # ← 修正 2：論文的關鍵設計
-        stratify     = y_tv,          # 額外保證：強制各子集標籤比例相同
-    )
-
-    X_tr = X_tv[tr_local_indices]
-    y_tr = y_tv[tr_local_indices]
-    X_va = X_tv[va_local_indices]
-    y_va = y_tv[va_local_indices]
-    meta_train = meta_df.iloc[train_val_indices[tr_local_indices]].reset_index(drop=True)
-    meta_val = meta_df.iloc[train_val_indices[va_local_indices]].reset_index(drop=True)
-
-    print(f"  Train: {len(X_tr)}  (up={y_tr.mean():.3f})")
-    print(f"  Val  : {len(X_va)}  (up={y_va.mean():.3f})")
-    print(f"  Test : {len(X_te)}  (up={y_te.mean():.3f})")
-
-    # ── 儲存 ─────────────────────────────────────────────────────────────────
-    for name, arr in [
-        ("X_train", X_tr), ("X_val", X_va), ("X_test", X_te),
-        ("y_train", y_tr), ("y_val", y_va), ("y_test", y_te),
-        ("X_trainval", X_tv), ("y_trainval", y_tv),
-    ]:
-        np.save(os.path.join(dataset_dir, f"{name}.npy"), arr)
-    meta_df.to_csv(os.path.join(dataset_dir, "meta.csv"), index=False)
-    meta_trainval = meta_df.iloc[train_val_indices].reset_index(drop=True)
-    meta_trainval.to_csv(os.path.join(dataset_dir, "meta_trainval.csv"), index=False)
-    meta_train.to_csv(os.path.join(dataset_dir, "meta_train.csv"), index=False)
-    meta_val.to_csv(os.path.join(dataset_dir, "meta_val.csv"), index=False)
-    meta_test.to_csv(os.path.join(dataset_dir, "meta_test.csv"), index=False)
-    _save_feather_if_available(meta_df, os.path.join(dataset_dir, "meta.feather"))
-    _save_feather_if_available(meta_trainval, os.path.join(dataset_dir, "meta_trainval.feather"))
-    _save_feather_if_available(meta_train, os.path.join(dataset_dir, "meta_train.feather"))
-    _save_feather_if_available(meta_val, os.path.join(dataset_dir, "meta_val.feather"))
-    _save_feather_if_available(meta_test, os.path.join(dataset_dir, "meta_test.feather"))
-    _save_sample_images(dataset_dir, X_all, meta_df, limit=sample_image_count)
-    _write_build_log(
-        dataset_dir=dataset_dir,
-        Market=Market,
-        start=start,
-        end=end,
-        train_end=train_end,
-        I=I,
-        R=R,
-        sample_step=sample_step,
-        price_source=price_source,
-        strict_time_split=strict_time_split,
-        max_workers=max_workers,
-        checkpoint_every=checkpoint_every,
-        checkpoint_save_arrays=checkpoint_save_arrays,
-        year_ticker_chunk_size=year_ticker_chunk_size,
-        process_by=process_by,
-        total_tickers=len(tickers),
-        done_tickers=done_tickers,
-        skipped_rows=skipped_rows,
-        dropped=dropped,
-        X_tr=X_tr,
-        y_tr=y_tr,
-        X_va=X_va,
-        y_va=y_va,
-        X_te=X_te,
-        y_te=y_te,
-    )
-
-    print(f"\n已儲存至 {dataset_dir}/")
-    return X_tr, y_tr, X_va, y_va, X_te, y_te, meta_df
 
 
 # =========================================================

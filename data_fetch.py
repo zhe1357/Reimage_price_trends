@@ -15,6 +15,59 @@ NASDAQ_LISTED_TXT = "https://www.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.tx
 OTHER_LISTED_TXT = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 
 
+def _has_crsp_files(path: Path) -> bool:
+    return any(path.glob("crsp_*.parquet")) or any(path.glob("crsp_*.pq"))
+
+
+def resolve_crsp_data_dir(
+    crsp_data_dir: str | None = None,
+    env_var: str = "CRSP_DATA_DIR",
+) -> str:
+    """
+    Resolve the CRSP data folder across machines.
+
+    Priority:
+    1. Explicit function argument
+    2. CRSP_DATA_DIR environment variable
+    3. Common local folders near the notebook/repo
+    """
+    if crsp_data_dir:
+        path = Path(crsp_data_dir).expanduser()
+        if _has_crsp_files(path):
+            return str(path)
+
+    env_value = os.environ.get(env_var)
+    if env_value:
+        path = Path(env_value).expanduser()
+        if _has_crsp_files(path):
+            return str(path)
+        raise FileNotFoundError(
+            f"{env_var}={path} does not contain files like crsp_1993.parquet."
+        )
+
+    module_dir = Path(__file__).resolve().parent
+    candidates = [
+        Path("us_stock_data"),
+        Path("us_stock"),
+        Path("../us_stock_data"),
+        Path("../us_stock"),
+        module_dir / "us_stock_data",
+        module_dir / "us_stock",
+        module_dir.parent / "us_stock_data",
+        module_dir.parent / "us_stock",
+    ]
+    for path in candidates:
+        path = path.expanduser()
+        if _has_crsp_files(path):
+            return str(path)
+
+    searched = ", ".join(str(path) for path in candidates)
+    raise FileNotFoundError(
+        "Could not find CRSP parquet files. Set CRSP_DATA_DIR to the folder "
+        f"containing files like crsp_1993.parquet. Searched: {searched}"
+    )
+
+
 def _years_between(start: str, end: str) -> range:
     start_year = pd.to_datetime(start).year
     end_year = pd.to_datetime(end).year
@@ -100,11 +153,12 @@ def get_crsp_trading_calendar(
 ) -> pd.DatetimeIndex:
     """Return the CRSP market dates available in the yearly parquet files."""
     data_dir = Path(crsp_data_dir)
+    cache_dir = data_dir / "crsp_trading_calendar"
     cache_path = None
     if use_cache and start is not None and end is not None:
         start_tag = str(start).replace("-", "")
         end_tag = str(end).replace("-", "")
-        cache_path = data_dir / f"_crsp_trading_calendar_{start_tag}_{end_tag}.csv"
+        cache_path = cache_dir / f"_crsp_trading_calendar_{start_tag}_{end_tag}.csv"
         if cache_path.exists() and cache_path.stat().st_size > 0:
             cached = pd.read_csv(cache_path)
             return pd.DatetimeIndex(pd.to_datetime(cached["date"], errors="coerce").dropna())

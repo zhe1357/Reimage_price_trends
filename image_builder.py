@@ -1,15 +1,24 @@
+from __future__ import annotations
+
 import numpy as np
 import pandas as pd
 
 
-# Image dimensions used by Jiang, Kelly, Xiu style price images.
+# Jiang, Kelly, Xiu style price-image geometry.
+BAR_WIDTH = 3
+VOLUME_CHART_GAP = 1
 IMAGE_HEIGHTS = {5: 32, 20: 64, 60: 96}
 
 
-def draw_line(image: np.ndarray, r0: int, c0: int, r1: int, c1: int, value: float = 255.0):
-    """
-    以線性插值在兩點之間畫線（對應論文 'connect those dots' 的 MA 連線邏輯）。
-    """
+def draw_line(
+    image: np.ndarray,
+    r0: int,
+    c0: int,
+    r1: int,
+    c1: int,
+    value: float = 255.0,
+):
+    """Draw a one-pixel line with linear interpolation."""
     steps = max(abs(r1 - r0), abs(c1 - c0)) + 1
     rr = np.rint(np.linspace(r0, r1, steps)).astype(int)
     cc = np.rint(np.linspace(c0, c1, steps)).astype(int)
@@ -17,42 +26,27 @@ def draw_line(image: np.ndarray, r0: int, c0: int, r1: int, c1: int, value: floa
     image[rr[valid], cc[valid]] = value
 
 
-# =========================================================
-# 2. 圖像生成（對齊論文 Section I）
-# =========================================================
-def generate_research_image(window_df: pd.DataFrame, I: int) -> np.ndarray:
-    """
-    Generate an OHLC + optional MA + volume image.
+def _to_float_array(df: pd.DataFrame, column: str) -> np.ndarray:
+    return pd.to_numeric(df[column], errors="coerce").to_numpy(dtype=float)
 
-    Missing fields are handled at the visual-element level:
-    - missing high or low: skip the main high-low bar for that day
-    - missing open: skip only the open tick
-    - missing close: skip only the close tick
-    - missing volume: skip only the volume bar
-    - missing MA point: skip that MA point/segment
-    """
-    img_height = IMAGE_HEIGHTS.get(I, 64)
-    img_width = I * 3
 
-    vol_area_h = img_height // 5
-    price_area_h = img_height - vol_area_h
-
-    raw_open = pd.to_numeric(window_df["open"], errors="coerce").to_numpy(dtype=float)
-    raw_high = pd.to_numeric(window_df["high"], errors="coerce").to_numpy(dtype=float)
-    raw_low = pd.to_numeric(window_df["low"], errors="coerce").to_numpy(dtype=float)
-    raw_close = pd.to_numeric(window_df["close"], errors="coerce").to_numpy(dtype=float)
-    vol = pd.to_numeric(window_df["volume"], errors="coerce").to_numpy(dtype=float)
+def _adjust_ohlc_with_returns(window_df: pd.DataFrame):
+    raw_open = _to_float_array(window_df, "open")
+    raw_high = _to_float_array(window_df, "high")
+    raw_low = _to_float_array(window_df, "low")
+    raw_close = _to_float_array(window_df, "close")
 
     if "ret" in window_df.columns:
         rets = pd.to_numeric(window_df["ret"], errors="coerce")
     else:
-        px = pd.Series(raw_close)
-        rets = px.pct_change(fill_method=None)
+        rets = pd.Series(raw_close).pct_change(fill_method=None)
 
-    close_path = np.full(I, np.nan, dtype=float)
-    if np.isfinite(raw_close[0]) and raw_close[0] != 0:
-        close_path[0] = 1.0
-    for t in range(1, I):
+    if not (np.isfinite(raw_close[0]) and raw_close[0] != 0):
+        raise ValueError("first close is missing or zero")
+
+    close_path = np.full(len(window_df), np.nan, dtype=float)
+    close_path[0] = 1.0
+    for t in range(1, len(window_df)):
         if pd.isna(rets.iloc[t]):
             continue
         previous_valid = np.where(np.isfinite(close_path[:t]))[0]
@@ -62,7 +56,7 @@ def generate_research_image(window_df: pd.DataFrame, I: int) -> np.ndarray:
     close_scale = np.divide(
         close_path,
         raw_close,
-        out=np.full(I, np.nan, dtype=float),
+        out=np.full(len(window_df), np.nan, dtype=float),
         where=np.isfinite(close_path) & np.isfinite(raw_close) & (raw_close != 0),
     )
     scale = pd.Series(close_scale).ffill().to_numpy()
@@ -71,13 +65,68 @@ def generate_research_image(window_df: pd.DataFrame, I: int) -> np.ndarray:
     high_path = raw_high * scale
     low_path = raw_low * scale
     close_tick_path = np.where(np.isfinite(raw_close), close_path, np.nan)
+    return open_path, high_path, low_path, close_tick_path
 
-    draw_ma = I != 5
-    ma_path = pd.Series(close_path).rolling(window=I, min_periods=1).mean().to_numpy()
 
-    price_parts = [open_path, high_path, low_path, close_tick_path]
-    if draw_ma:
-        price_parts.append(ma_path)
+def generate_research_image(
+    window_df: pd.DataFrame,
+    I: int,
+    has_volume_bar: bool = True,
+    ma_lags: list[int] | None = None,
+) -> np.ndarray:
+    """
+    Generate an OHLC + optional MA + volume image.
+
+    `window_df` may include pre-window history. Only the last `I` rows are drawn,
+    while MA lines are computed from all supplied rows, matching the paper code's
+    "load I + ma_lag rows, draw the last I rows" behavior.
+    """
+    if I not in IMAGE_HEIGHTS:
+        raise ValueError("I must be one of 5, 20, or 60")
+    if len(window_df) < I:
+        raise ValueError("window_df must contain at least I rows")
+    if ma_lags is None:
+        ma_lags = [] if I == 5 else [I]
+
+    img_height = IMAGE_HEIGHTS[I]
+    img_width = I * BAR_WIDTH
+    vol_area_h = img_height // 5 if has_volume_bar else 0
+    gap_h = VOLUME_CHART_GAP if has_volume_bar else 0
+    price_area_h = img_height - vol_area_h - gap_h
+    if price_area_h <= 1:
+        raise ValueError("price area is too small")
+
+    open_path, high_path, low_path, close_path = _adjust_ohlc_with_returns(window_df)
+    vol = _to_float_array(window_df, "volume")
+
+    chart_start = len(window_df) - I
+    start_close = close_path[chart_start]
+    if not (np.isfinite(start_close) and start_close != 0):
+        raise ValueError("chart start close cannot be normalized")
+
+    open_path = open_path / start_close
+    high_path = high_path / start_close
+    low_path = low_path / start_close
+    close_path = close_path / start_close
+
+    ma_paths = []
+    for lag in ma_lags:
+        lag = int(lag)
+        if lag <= 0 or len(window_df) < I + lag:
+            continue
+        ma_paths.append(
+            pd.Series(close_path).rolling(window=lag, min_periods=lag).mean().to_numpy()
+        )
+
+    open_draw = open_path[chart_start:]
+    high_draw = high_path[chart_start:]
+    low_draw = low_path[chart_start:]
+    close_draw = close_path[chart_start:]
+    vol_draw = vol[chart_start:]
+    ma_draws = [ma_path[chart_start:] for ma_path in ma_paths]
+
+    price_parts = [open_draw, high_draw, low_draw, close_draw]
+    price_parts.extend(ma_draws)
     all_prices = np.concatenate(price_parts)
     if np.all(np.isnan(all_prices)):
         raise ValueError("price range cannot be computed for this window")
@@ -87,60 +136,52 @@ def generate_research_image(window_df: pd.DataFrame, I: int) -> np.ndarray:
     if not (np.isfinite(p_min) and np.isfinite(p_max)):
         raise ValueError("price range cannot be computed for this window")
     if p_max == p_min:
-        p_max = p_min + 1e-8
+        raise ValueError("price range is flat")
 
-    def price_to_row(p):
-        scaled = (p - p_min) / (p_max - p_min) * (price_area_h - 1)
-        return int(np.rint((price_area_h - 1) - scaled))
+    def price_to_row(price):
+        scaled = (price - p_min) / (p_max - p_min) * (price_area_h - 1)
+        row = int(np.rint((price_area_h - 1) - scaled))
+        return min(max(row, 0), price_area_h - 1)
 
-    v_max = np.nanmax(vol)
-    if not np.isfinite(v_max) or v_max <= 0:
+    v_max = np.nanmax(np.abs(vol_draw)) if has_volume_bar else np.nan
+    if has_volume_bar and (not np.isfinite(v_max) or v_max <= 0):
         v_max = 1.0
 
     image = np.zeros((img_height, img_width), dtype=np.float32)
-    prev_ma_row = None
-    prev_ma_col = None
+    ma_prev = [(None, None) for _ in ma_draws]
 
     for i in range(I):
-        col_left = i * 3
+        col_left = i * BAR_WIDTH
         col_mid = col_left + 1
         col_right = col_left + 2
 
-        has_high_low = np.isfinite(high_path[i]) and np.isfinite(low_path[i])
-        has_open = np.isfinite(open_path[i])
-        has_close = np.isfinite(close_tick_path[i])
-        has_volume = np.isfinite(vol[i]) and vol[i] > 0
-
-        if has_high_low:
-            high_row = price_to_row(high_path[i])
-            low_row = price_to_row(low_path[i])
+        if np.isfinite(high_draw[i]) and np.isfinite(low_draw[i]):
+            high_row = price_to_row(high_draw[i])
+            low_row = price_to_row(low_draw[i])
             top = min(high_row, low_row)
-            bot = max(high_row, low_row)
-            image[top : bot + 1, col_mid] = 255.0
+            bottom = max(high_row, low_row)
+            image[top : bottom + 1, col_mid] = 255.0
 
-        if has_open:
-            open_row = price_to_row(open_path[i])
-            image[open_row, col_left] = 255.0
+        if np.isfinite(open_draw[i]):
+            image[price_to_row(open_draw[i]), col_left] = 255.0
 
-        if has_close:
-            close_row = price_to_row(close_tick_path[i])
-            image[close_row, col_right] = 255.0
+        if np.isfinite(close_draw[i]):
+            image[price_to_row(close_draw[i]), col_right] = 255.0
 
-        if draw_ma:
+        for ma_idx, ma_path in enumerate(ma_draws):
+            prev_row, prev_col = ma_prev[ma_idx]
             if np.isfinite(ma_path[i]):
                 ma_row = price_to_row(ma_path[i])
                 image[ma_row, col_mid] = 255.0
-                if prev_ma_row is not None:
-                    draw_line(image, prev_ma_row, prev_ma_col, ma_row, col_mid, value=255.0)
-                prev_ma_row = ma_row
-                prev_ma_col = col_mid
+                if prev_row is not None:
+                    draw_line(image, prev_row, prev_col, ma_row, col_mid, value=255.0)
+                ma_prev[ma_idx] = (ma_row, col_mid)
             else:
-                prev_ma_row = None
-                prev_ma_col = None
+                ma_prev[ma_idx] = (None, None)
 
-        if has_volume:
-            vh = int(np.rint(vol[i] / v_max * (vol_area_h - 1)))
-            vh = max(vh, 1)
-            image[img_height - vh : img_height, col_mid] = 255.0
+        if has_volume_bar and np.isfinite(vol_draw[i]) and vol_draw[i] > 0:
+            vol_height = int(np.rint(abs(vol_draw[i]) / v_max * vol_area_h))
+            vol_height = min(max(vol_height, 1), vol_area_h)
+            image[img_height - vol_height : img_height, col_mid] = 255.0
 
-    return image
+    return image.astype(np.uint8, copy=False)
