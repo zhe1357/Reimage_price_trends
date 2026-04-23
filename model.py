@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
+from tqdm.auto import tqdm
 
 class CNN_I5(nn.Module):
     def __init__(self):
@@ -256,7 +257,13 @@ def train_one_resplit_model(
     best_path = os.path.join(save_dir, f"{Market}_best_model_I{I}R{R}_seed{seed}.pth")
     history = []
 
-    for epoch in range(epochs):
+    epoch_bar = tqdm(
+        range(epochs),
+        desc=f"seed {seed}",
+        leave=False,
+        dynamic_ncols=True,
+    )
+    for epoch in epoch_bar:
         model.train()
         train_loss = 0.0
         for images, labels in train_loader:
@@ -302,10 +309,11 @@ def train_one_resplit_model(
                 best_path,
             )
 
-        print(
-            f"[seed {seed}] Epoch {epoch + 1}/{epochs} | "
-            f"Train Loss: {train_loss:.4f} | Val Loss: {val_loss:.4f} | "
-            f"Val Acc: {val_acc * 100:.2f}%"
+        epoch_bar.set_postfix(
+            train_loss=f"{train_loss:.4f}",
+            val_loss=f"{val_loss:.4f}",
+            val_acc=f"{val_acc * 100:.2f}%",
+            best=f"{best_score * 100:.2f}%" if monitor == "val_acc" else f"{best_score:.4f}",
         )
 
     return {
@@ -337,7 +345,13 @@ def train_resplit_ensemble(
     a different initialization. Each seed's best checkpoint is saved.
     """
     results = []
-    for seed in seeds:
+    seed_bar = tqdm(
+        list(seeds),
+        desc="ensemble runs",
+        dynamic_ncols=True,
+    )
+    for seed in seed_bar:
+        seed_bar.set_postfix(seed=seed)
         result = train_one_resplit_model(
             X_trainval=X_trainval,
             y_trainval=y_trainval,
@@ -361,7 +375,10 @@ def train_resplit_ensemble(
 def predict_proba_from_checkpoint(X, checkpoint_path, batch_size=256, num_workers=0, device=None):
     """Predict P(label=1) using a saved ensemble checkpoint."""
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-    checkpoint = torch.load(checkpoint_path, map_location=device)
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
     model = make_model(int(checkpoint["I"])).to(device)
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
