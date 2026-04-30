@@ -1,0 +1,22 @@
+name: reimage-price-trends
+channels:
+  - pytorch
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.11
+  - numpy
+  - pandas
+  - scikit-learn
+  - tqdm
+  - pillow
+  - pyarrow
+  - jupyter
+  - notebook
+  - ipykernel
+  - pytorch
+  - torchvision
+  - torchaudio
+  - pip
+  - pip:
+      - yfinance

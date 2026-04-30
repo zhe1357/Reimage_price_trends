@@ -16,6 +16,7 @@ OTHER_LISTED_TXT = "https://www.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
 
 
 def _has_crsp_files(path: Path) -> bool:
+    # 確認是否有crsp的資料
     return any(path.glob("crsp_*.parquet")) or any(path.glob("crsp_*.pq"))
 
 
@@ -38,7 +39,7 @@ def resolve_crsp_data_dir(
 
     env_value = os.environ.get(env_var)
     if env_value:
-        path = Path(env_value).expanduser()
+        path = Path(eunv_vale).expanduser()
         if _has_crsp_files(path):
             return str(path)
         raise FileNotFoundError(
@@ -84,7 +85,7 @@ def _find_crsp_file(crsp_data_dir: str, year: int) -> Path | None:
 
 
 def get_crsp_permno_universe(
-    crsp_data_dir: str = "us_stock_data",
+    crsp_data_dir: str = "us_stock",
     start: str | None = None,
     end: str | None = None,
     return_info: bool = False,
@@ -146,7 +147,7 @@ def get_crsp_permno_universe(
 
 
 def get_crsp_trading_calendar(
-    crsp_data_dir: str = "us_stock_data",
+    crsp_data_dir: str = "us_stock",
     start: str | None = None,
     end: str | None = None,
     use_cache: bool = True,

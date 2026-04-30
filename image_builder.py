@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from PIL import Image, ImageDraw
 
 
 # Jiang, Kelly, Xiu style price-image geometry.
@@ -18,12 +19,23 @@ def draw_line(
     c1: int,
     value: float = 255.0,
 ):
-    """Draw a one-pixel line with linear interpolation."""
-    steps = max(abs(r1 - r0), abs(c1 - c0)) + 1
-    rr = np.rint(np.linspace(r0, r1, steps)).astype(int)
-    cc = np.rint(np.linspace(c0, c1, steps)).astype(int)
-    valid = (rr >= 0) & (rr < image.shape[0]) & (cc >= 0) & (cc < image.shape[1])
-    image[rr[valid], cc[valid]] = value
+    """Draw a one-pixel line using PIL's rasterization on a tight local bbox."""
+    row_min = max(min(r0, r1), 0)
+    row_max = min(max(r0, r1), image.shape[0] - 1)
+    col_min = max(min(c0, c1), 0)
+    col_max = min(max(c0, c1), image.shape[1] - 1)
+    if row_min > row_max or col_min > col_max:
+        return
+
+    patch_h = row_max - row_min + 1
+    patch_w = col_max - col_min + 1
+    patch = Image.new("L", (patch_w, patch_h), 0)
+    draw = ImageDraw.Draw(patch)
+    draw.line((c0 - col_min, r0 - row_min, c1 - col_min, r1 - row_min), width=1, fill=int(value))
+    patch_arr = np.asarray(patch, dtype=image.dtype)
+    image[row_min : row_max + 1, col_min : col_max + 1] = np.maximum(
+        image[row_min : row_max + 1, col_min : col_max + 1], patch_arr
+    )
 
 
 def _to_float_array(df: pd.DataFrame, column: str) -> np.ndarray:
@@ -44,27 +56,43 @@ def _adjust_ohlc_with_returns(window_df: pd.DataFrame):
     if not (np.isfinite(raw_close[0]) and raw_close[0] != 0):
         raise ValueError("first close is missing or zero")
 
-    close_path = np.full(len(window_df), np.nan, dtype=float)
-    close_path[0] = 1.0
+    open_path = np.full(len(window_df), np.nan, dtype=float)
+    high_path = np.full(len(window_df), np.nan, dtype=float)
+    low_path = np.full(len(window_df), np.nan, dtype=float)
+    close_tick_path = np.full(len(window_df), np.nan, dtype=float)
+
+    first_close = abs(raw_close[0])
+    close_tick_path[0] = 1.0
+    if np.isfinite(raw_open[0]):
+        open_path[0] = abs(raw_open[0]) / first_close
+    if np.isfinite(raw_high[0]):
+        high_path[0] = abs(raw_high[0]) / first_close
+    if np.isfinite(raw_low[0]):
+        low_path[0] = abs(raw_low[0]) / first_close
+
+    prev_close = 1.0
     for t in range(1, len(window_df)):
-        if pd.isna(rets.iloc[t]):
+        today_close = abs(raw_close[t]) if np.isfinite(raw_close[t]) else np.nan
+        today_open = abs(raw_open[t]) if np.isfinite(raw_open[t]) else np.nan
+        today_high = abs(raw_high[t]) if np.isfinite(raw_high[t]) else np.nan
+        today_low = abs(raw_low[t]) if np.isfinite(raw_low[t]) else np.nan
+        today_ret = pd.to_numeric(pd.Series([rets.iloc[t]]), errors="coerce").iloc[0]
+
+        if not np.isfinite(today_ret):
             continue
-        previous_valid = np.where(np.isfinite(close_path[:t]))[0]
-        prev_close = close_path[previous_valid[-1]] if len(previous_valid) else 1.0
-        close_path[t] = prev_close * (1.0 + float(rets.iloc[t]))
 
-    close_scale = np.divide(
-        close_path,
-        raw_close,
-        out=np.full(len(window_df), np.nan, dtype=float),
-        where=np.isfinite(close_path) & np.isfinite(raw_close) & (raw_close != 0),
-    )
-    scale = pd.Series(close_scale).ffill().to_numpy()
+        close_tick_path[t] = (1.0 + float(today_ret)) * prev_close
+        if np.isfinite(today_close) and today_close != 0:
+            if np.isfinite(today_open):
+                open_path[t] = close_tick_path[t] / today_close * today_open
+            if np.isfinite(today_high):
+                high_path[t] = close_tick_path[t] / today_close * today_high
+            if np.isfinite(today_low):
+                low_path[t] = close_tick_path[t] / today_close * today_low
 
-    open_path = raw_open * scale
-    high_path = raw_high * scale
-    low_path = raw_low * scale
-    close_tick_path = np.where(np.isfinite(raw_close), close_path, np.nan)
+        if np.isfinite(close_tick_path[t]):
+            prev_close = close_tick_path[t]
+
     return open_path, high_path, low_path, close_tick_path
 
 
@@ -87,6 +115,12 @@ def generate_research_image(
         raise ValueError("window_df must contain at least I rows")
     if ma_lags is None:
         ma_lags = [] if I == 5 else [I]
+    else:
+        ma_lags = [int(lag) for lag in ma_lags]
+
+    max_ma_lag = max(ma_lags, default=0)
+    if len(window_df) < I + max_ma_lag:
+        ma_lags = []
 
     img_height = IMAGE_HEIGHTS[I]
     img_width = I * BAR_WIDTH
@@ -138,14 +172,16 @@ def generate_research_image(
     if p_max == p_min:
         raise ValueError("price range is flat")
 
+    pixels_per_unit = (price_area_h - 1.0) / (p_max - p_min)
+
     def price_to_row(price):
-        scaled = (price - p_min) / (p_max - p_min) * (price_area_h - 1)
-        row = int(np.rint((price_area_h - 1) - scaled))
+        # Match JS_cnn.DrawOHLC.__ret_to_yaxis() exactly, then mirror the row
+        # because JS_cnn flips the PIL canvas at the very end.
+        y_axis = int(np.around((price - p_min) * pixels_per_unit))
+        row = (price_area_h - 1) - y_axis
         return min(max(row, 0), price_area_h - 1)
 
     v_max = np.nanmax(np.abs(vol_draw)) if has_volume_bar else np.nan
-    if has_volume_bar and (not np.isfinite(v_max) or v_max <= 0):
-        v_max = 1.0
 
     image = np.zeros((img_height, img_width), dtype=np.float32)
     ma_prev = [(None, None) for _ in ma_draws]
@@ -155,17 +191,18 @@ def generate_research_image(
         col_mid = col_left + 1
         col_right = col_left + 2
 
-        if np.isfinite(high_draw[i]) and np.isfinite(low_draw[i]):
+        draw_candle = np.isfinite(high_draw[i]) and np.isfinite(low_draw[i])
+        if draw_candle:
             high_row = price_to_row(high_draw[i])
             low_row = price_to_row(low_draw[i])
             top = min(high_row, low_row)
             bottom = max(high_row, low_row)
             image[top : bottom + 1, col_mid] = 255.0
 
-        if np.isfinite(open_draw[i]):
+        if draw_candle and np.isfinite(open_draw[i]):
             image[price_to_row(open_draw[i]), col_left] = 255.0
 
-        if np.isfinite(close_draw[i]):
+        if draw_candle and np.isfinite(close_draw[i]):
             image[price_to_row(close_draw[i]), col_right] = 255.0
 
         for ma_idx, ma_path in enumerate(ma_draws):
@@ -179,9 +216,11 @@ def generate_research_image(
             else:
                 ma_prev[ma_idx] = (None, None)
 
-        if has_volume_bar and np.isfinite(vol_draw[i]) and vol_draw[i] > 0:
-            vol_height = int(np.rint(abs(vol_draw[i]) / v_max * vol_area_h))
-            vol_height = min(max(vol_height, 1), vol_area_h)
+        if has_volume_bar and np.isfinite(v_max) and v_max != 0 and np.isfinite(vol_draw[i]):
+            vol_height = int(np.rint(abs(vol_draw[i]) / abs(v_max) * vol_area_h))
+            if vol_height <= 0:
+                vol_height = 1
+            vol_height = min(vol_height, vol_area_h)
             image[img_height - vol_height : img_height, col_mid] = 255.0
 
     return image.astype(np.uint8, copy=False)

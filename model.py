@@ -1,12 +1,14 @@
 import os
 import random
+import sys
+from pathlib import Path
 
 import numpy as np
 import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
-from tqdm.auto import tqdm
+from tqdm import tqdm
 
 class CNN_I5(nn.Module):
     def __init__(self):
@@ -411,6 +413,171 @@ def average_ensemble_predictions(X, checkpoint_paths, batch_size=256, num_worker
             batch_size=batch_size,
             num_workers=num_workers,
             device=device,
+        )
+        for path in checkpoint_paths
+    ]
+    return np.mean(np.vstack(preds), axis=0)
+
+
+def _get_js_cnn_root() -> Path:
+    return Path(__file__).resolve().parent.parent / "JS_cnn"
+
+
+def _ensure_js_cnn_on_path():
+    js_root = _get_js_cnn_root()
+    js_root_str = str(js_root)
+    if js_root_str not in sys.path:
+        sys.path.insert(0, js_root_str)
+
+
+def _load_js_mean_std(
+    year: int,
+    ws: int,
+    has_volume_bar: bool = True,
+    has_ma: bool = True,
+    chart_type: str = "bar",
+    ohlc_len: int | None = None,
+):
+    _ensure_js_cnn_on_path()
+    from Data import dgp_config as dcf
+    from Misc import config as cf
+
+    ohlc_len = ws if ohlc_len is None else ohlc_len
+    ohlc_len_suffix = f"_{ohlc_len}ohlc" if ohlc_len != ws else ""
+    chart_suffix = f"_{chart_type}" if chart_type != "bar" else ""
+    mean_std_name = (
+        f"mean_std_{ws}dmonth_vb{has_volume_bar}_ma{has_ma}_{year}"
+        f"{ohlc_len_suffix}{chart_suffix}.npz"
+    )
+    mean_std_path = Path(dcf.STOCKS_SAVEPATH) / "stocks_USA" / "dataset_all" / mean_std_name
+    if not mean_std_path.exists():
+        raise FileNotFoundError(f"JS_cnn mean/std file not found: {mean_std_path}")
+    stats = np.load(mean_std_path, allow_pickle=True)
+    return float(stats["mean"]), float(stats["std"])
+
+
+def _make_js_cnn_model(
+    ws: int,
+    device=None,
+    batch_norm: bool = True,
+    drop_prob: float = 0.50,
+):
+    _ensure_js_cnn_on_path()
+    from Misc import config as cf
+    from Model.cnn_model import Model as JSCNNModel
+
+    filter_size_list, stride_list, dilation_list, max_pooling_list = cf.EMP_CNN_BL_SETTING[ws]
+    layer_number = cf.BENCHMARK_MODEL_LAYERNUM_DICT[ws]
+    model_obj = JSCNNModel(
+        ws=ws,
+        layer_number=layer_number,
+        inplanes=cf.TRUE_DATA_CNN_INPLANES,
+        drop_prob=drop_prob,
+        filter_size_list=filter_size_list,
+        stride_list=stride_list,
+        dilation_list=dilation_list,
+        max_pooling_list=max_pooling_list,
+        batch_norm=batch_norm,
+        xavier=True,
+        lrelu=True,
+        bn_loc="bn_bf_relu",
+        conv_layer_chanls=None,
+        regression_label=None,
+    )
+    return model_obj.init_model(device=device)
+
+
+def predict_proba_from_js_checkpoint(
+    X,
+    checkpoint_path,
+    year: int,
+    ws: int = 20,
+    batch_size: int = 256,
+    num_workers: int = 0,
+    device=None,
+    has_volume_bar: bool = True,
+    has_ma: bool = True,
+    chart_type: str = "bar",
+    batch_norm: bool = True,
+    drop_prob: float = 0.50,
+):
+    """
+    Predict P(label=1) using a JS_cnn checkpoint on Reimage-generated images.
+
+    `X` should be raw uint8-style images before normalization, shape (N, H, W).
+    `year` must match the JS_cnn dataset year used for that sample so the same
+    annual mean/std normalization is applied.
+    """
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    try:
+        checkpoint = torch.load(checkpoint_path, map_location=device, weights_only=False)
+    except TypeError:
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+
+    model = _make_js_cnn_model(
+        ws=ws,
+        device=device,
+        batch_norm=batch_norm,
+        drop_prob=drop_prob,
+    )
+    model.load_state_dict(checkpoint["model_state_dict"])
+    model.eval()
+
+    mean, std = _load_js_mean_std(
+        year=year,
+        ws=ws,
+        has_volume_bar=has_volume_bar,
+        has_ma=has_ma,
+        chart_type=chart_type,
+    )
+    X_float = np.asarray(X, dtype=np.float32)
+    X_n = ((X_float / 255.0) - mean) / std
+    loader = _make_loader(
+        X_n,
+        np.zeros(len(X_n), dtype=np.int64),
+        batch_size=batch_size,
+        shuffle=False,
+        num_workers=num_workers,
+    )
+
+    probs = []
+    with torch.no_grad():
+        for images, _ in loader:
+            images = images.to(device)
+            outputs = model(images)
+            p = torch.softmax(outputs, dim=1)[:, 1]
+            probs.append(p.cpu().numpy())
+    return np.concatenate(probs)
+
+
+def average_js_cnn_ensemble_predictions(
+    X,
+    checkpoint_paths,
+    year: int,
+    ws: int = 20,
+    batch_size: int = 256,
+    num_workers: int = 0,
+    device=None,
+    has_volume_bar: bool = True,
+    has_ma: bool = True,
+    chart_type: str = "bar",
+    batch_norm: bool = True,
+    drop_prob: float = 0.50,
+):
+    preds = [
+        predict_proba_from_js_checkpoint(
+            X,
+            path,
+            year=year,
+            ws=ws,
+            batch_size=batch_size,
+            num_workers=num_workers,
+            device=device,
+            has_volume_bar=has_volume_bar,
+            has_ma=has_ma,
+            chart_type=chart_type,
+            batch_norm=batch_norm,
+            drop_prob=drop_prob,
         )
         for path in checkpoint_paths
     ]

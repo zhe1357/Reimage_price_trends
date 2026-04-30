@@ -221,6 +221,7 @@ def _write_build_log(
         f"sample_freq: {sample_freq}",
         f"price_source: {price_source}",
         f"strict_time_split: {strict_time_split}",
+        f"split_basis: {'start_date/label_end_date strict boundary' if strict_time_split else 'ending_date'}",
         f"max_workers: {max_workers}",
         f"checkpoint_every: {checkpoint_every}",
         f"checkpoint_save_arrays: {checkpoint_save_arrays}",
@@ -255,9 +256,28 @@ def _save_sample_images(dataset_dir, X, meta_df, limit=8):
 
     sample_dir = os.path.join(dataset_dir, "sample_images")
     os.makedirs(sample_dir, exist_ok=True)
-    n = min(int(limit), len(X))
+    max_images = int(limit)
+    selected = []
+    seen_per_year = {}
 
-    for idx in range(n):
+    for idx in range(len(meta_df)):
+        row = meta_df.iloc[idx]
+        date_value = pd.to_datetime(row.get("date"), errors="coerce")
+        if pd.isna(date_value):
+            continue
+        year = int(date_value.year)
+        ticker = str(row.get("ticker", "unknown"))
+        year_seen = seen_per_year.setdefault(year, set())
+        if ticker in year_seen:
+            continue
+        if len(year_seen) >= 2:
+            continue
+        year_seen.add(ticker)
+        selected.append(idx)
+        if len(selected) >= max_images:
+            break
+
+    for idx in selected:
         row = meta_df.iloc[idx]
         ticker = str(row.get("ticker", "unknown")).replace(os.sep, "_")
         date = pd.to_datetime(row.get("date")).strftime("%Y-%m-%d")
@@ -337,17 +357,31 @@ def _candidate_end_indices(
     sample_step: int,
     sample_mode: str,
     sample_freq: str,
+    valid_row_mask: pd.Series | np.ndarray | None = None,
+    forced_period_ends: pd.DatetimeIndex | None = None,
 ) -> list[int]:
     if sample_mode == "step":
         return [i + I - 1 for i in range(0, len(df) - I + 1, sample_step)]
     if sample_mode != "period_end":
         raise ValueError("sample_mode must be 'period_end' or 'step'")
 
-    period_ends = set(_period_end_dates(df["date"], sample_freq))
+    dates = pd.to_datetime(df["date"], errors="coerce")
+    if forced_period_ends is not None:
+        period_ends = set(pd.DatetimeIndex(forced_period_ends))
+    elif valid_row_mask is not None:
+        valid_row_mask = pd.Series(valid_row_mask, index=df.index).fillna(False).astype(bool)
+        period_dates = dates[valid_row_mask]
+        period_ends = set(_period_end_dates(period_dates, sample_freq))
+    else:
+        period_dates = dates
+        period_ends = set(_period_end_dates(period_dates, sample_freq))
     dates = pd.to_datetime(df["date"], errors="coerce")
     return [
         idx for idx, date in enumerate(dates)
-        if idx >= I - 1 and pd.notna(date) and date in period_ends
+        if idx >= I - 1
+        and pd.notna(date)
+        and date in period_ends
+        and (valid_row_mask is None or bool(valid_row_mask.iloc[idx]))
     ]
 
 
@@ -380,27 +414,26 @@ def _build_ticker_samples_from_df(
     if missing:
         return ticker_key, images, labels, meta, f"missing columns: {missing}"
 
-    if trading_calendar is not None:
-        calendar = pd.DatetimeIndex(trading_calendar)
-        df = df.copy()
-        df["date"] = pd.to_datetime(df["date"], errors="coerce")
-        df = (
-            df.dropna(subset=["date"])
-            .sort_values("date")
-            .drop_duplicates(subset=["date"], keep="last")
-            .set_index("date")
-            .reindex(calendar)
-            .rename_axis("date")
-            .reset_index()
-        )
+    df = df.copy()
+    df["date"] = pd.to_datetime(df["date"], errors="coerce")
+    df = (
+        df.dropna(subset=["date"])
+        .sort_values("date")
+        .drop_duplicates(subset=["date"], keep="last")
+        .reset_index(drop=True)
+    )
+    if df.empty:
+        return ticker_key, images, labels, meta, "no valid dates"
 
+    # Compute labels on observed ticker rows before reindexing to the market
+    # calendar. Otherwise inserted calendar-only gaps turn multi-day CRSP
+    # returns into NaN and can wipe out every sample in sparse histories.
     df[f"ret{R}"] = _forward_return(df, R, price_source)
     df["label"] = (df[f"ret{R}"] > 0).where(df[f"ret{R}"].notna(), np.nan)
-    valid_price_row = df[["open", "high", "low", "close", "volume"]].notna().any(axis=1)
-    valid_ret_row = df[f"ret{R}"].notna()
-    df = df.reset_index(drop=True)
-    valid_price_row = valid_price_row.reset_index(drop=True)
-    valid_ret_row = valid_ret_row.reset_index(drop=True)
+
+    observed_df = df.reset_index(drop=True).copy()
+    valid_price_row = observed_df[["open", "high", "low", "close", "volume"]].notna().any(axis=1)
+    valid_ret_row = observed_df[f"ret{R}"].notna()
     valid_indices = np.flatnonzero(valid_price_row.to_numpy())
 
     if len(valid_indices) == 0:
@@ -409,17 +442,23 @@ def _build_ticker_samples_from_df(
     first_valid_idx = int(valid_indices[0])
     last_valid_idx = int(valid_indices[-1])
 
-    if len(df) < I + R + 5:
+    if len(observed_df) < I + R + 5:
         return ticker_key, images, labels, meta, "not enough rows"
 
     target_start = pd.to_datetime(target_start) if target_start is not None else None
     target_end = pd.to_datetime(target_end) if target_end is not None else None
+    forced_period_ends = None
+    if trading_calendar is not None and sample_mode == "period_end":
+        forced_period_ends = _period_end_dates(pd.Series(pd.DatetimeIndex(trading_calendar)), sample_freq)
+
     candidate_end_indices = _candidate_end_indices(
-        df,
+        observed_df,
         I=I,
         sample_step=sample_step,
         sample_mode=sample_mode,
         sample_freq=sample_freq,
+        valid_row_mask=valid_price_row,
+        forced_period_ends=forced_period_ends,
     )
     iterator = candidate_end_indices
     if show_progress:
@@ -427,26 +466,30 @@ def _build_ticker_samples_from_df(
 
     ma_offset = 0 if ma_lags is None else max([int(lag) for lag in ma_lags], default=0)
     for end_idx in iterator:
-        i = end_idx - I + 1
-        history_start = max(first_valid_idx, i - ma_offset)
-        window = df.iloc[history_start : end_idx + 1]
-
-        if i <= first_valid_idx or end_idx >= last_valid_idx:
+        if end_idx > last_valid_idx or end_idx + R >= len(observed_df):
+            continue
+        if not valid_price_row.iloc[end_idx]:
             continue
         if not valid_ret_row.iloc[end_idx]:
             continue
-        if end_idx + R >= len(df):
-            continue
 
-        end_date = df.iloc[end_idx]["date"]
+        end_date = observed_df.iloc[end_idx]["date"]
+        if forced_period_ends is not None and end_date not in set(forced_period_ends):
+            continue
         if target_start is not None and end_date < target_start:
             continue
         if target_end is not None and end_date >= target_end:
             continue
 
-        label = int(df.iloc[end_idx]["label"])
-        start_date = df.iloc[i]["date"]
-        label_end_date = df.iloc[end_idx + R]["date"]
+        observed_history_end = end_idx + 1
+        observed_history_start = max(0, observed_history_end - (I + ma_offset))
+        window = observed_df.iloc[observed_history_start:observed_history_end].copy()
+        if len(window) < I:
+            continue
+
+        label = int(observed_df.iloc[end_idx]["label"])
+        start_date = window.iloc[-I]["date"]
+        label_end_date = observed_df.iloc[end_idx + R]["date"]
 
         try:
             img = generate_research_image(
@@ -466,7 +509,7 @@ def _build_ticker_samples_from_df(
             "date": end_date,
             "label_end_date": label_end_date,
             "label": label,
-            "ret": df.iloc[end_idx][f"ret{R}"],
+            "ret": observed_df.iloc[end_idx][f"ret{R}"],
             "I": I,
             "R": R,
             "sample_step": sample_step,
@@ -641,7 +684,7 @@ def build_research_dataset(
     end,
     I    = 20,   # 圖像天數（5 / 20 / 60）
     R    = 20,   # 預測未來報酬天數（5 / 20 / 60）
-    train_end  = "2020-01-01",   # 訓練+驗證截止日（test 從此日開始）
+    train_end  = "2020-01-01",   # 訓練+驗證截止日（以 ending date 切出 test）
     val_ratio  = 0.3,            # 驗證集比例（論文：30%，隨機抽取）
     save_dir   = "data",
     random_state = 42,
@@ -654,7 +697,7 @@ def build_research_dataset(
     crsp_adjusted = True,
     has_volume_bar = True,
     ma_lags = None,
-    strict_time_split = True,
+    strict_time_split = False,
     checkpoint_every = 0,
     resume = False,
     max_workers = 1,
@@ -677,12 +720,16 @@ def build_research_dataset(
         開始的 R 天報酬方向（forward-looking）。
 
     [3] 訓練/驗證切割：
-        - 先以 train_end 日期分出 train_val 與 test
+        - 預設以樣本的 ending date（meta 欄位 `date`）分出 train_val 與 test
         - train_val 內部【隨機】切割 (1-val_ratio) / val_ratio
         - 論文明確指出隨機切割的目的：讓各子集的 up/down 比例
           各接近 50%，避免因多頭/空頭市場集中造成標籤不平衡。
           （按時間切割會讓驗證集全部落在單一市場環境，
            分類器看起來只會猜多數類，準確度停在 50~60%。）
+
+    [4] strict_time_split=False 時，test 歸屬只看 ending date，
+        因此測試樣本的 lookback window 可能回看到 train_end 之前的交易日。
+        這與原始作者以 ending date / year 歸屬樣本的做法一致。
 
     Returns
     -------
@@ -915,6 +962,9 @@ def build_research_dataset(
     meta_df["start_date"] = pd.to_datetime(meta_df["start_date"])
     meta_df["date"] = pd.to_datetime(meta_df["date"])
     meta_df["label_end_date"] = pd.to_datetime(meta_df["label_end_date"])
+    # Keep an explicit alias so downstream analysis can refer to the
+    # sample anchor consistently with the original codebase terminology.
+    meta_df["ending_date"] = meta_df["date"]
 
     if strict_time_split:
         train_val_mask = meta_df["label_end_date"] < split_date
@@ -924,6 +974,7 @@ def build_research_dataset(
     else:
         test_mask = meta_df["date"] >= split_date
         train_val_mask = ~test_mask
+        dropped = 0
 
     train_val_indices = np.flatnonzero(train_val_mask.to_numpy())
     test_indices = np.flatnonzero(test_mask.to_numpy())
