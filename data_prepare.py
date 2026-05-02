@@ -189,7 +189,6 @@ def _write_build_log(
     I,
     R,
     sample_step,
-    sample_mode,
     sample_freq,
     price_source,
     strict_time_split,
@@ -217,7 +216,6 @@ def _write_build_log(
         f"I: {I}",
         f"R: {R}",
         f"sample_step: {sample_step}",
-        f"sample_mode: {sample_mode}",
         f"sample_freq: {sample_freq}",
         f"price_source: {price_source}",
         f"strict_time_split: {strict_time_split}",
@@ -295,15 +293,12 @@ def get_dataset_output_dir(
     I: int,
     R: int,
     sample_step: int | None = None,
-    sample_mode: str | None = None,
     sample_freq: str | None = None,
 ) -> str:
     """Return the organized output folder for one generated dataset."""
     if sample_step is None:
         sample_step = R
     tag = f"I{I}R{R}S{sample_step}"
-    if sample_mode is not None:
-        tag = f"{tag}_{sample_mode}"
     if sample_freq is not None:
         tag = f"{tag}_{sample_freq}"
     return os.path.join(save_dir, "training_data", Market, tag)
@@ -355,15 +350,10 @@ def _candidate_end_indices(
     df: pd.DataFrame,
     I: int,
     sample_step: int,
-    sample_mode: str,
     sample_freq: str,
     valid_row_mask: pd.Series | np.ndarray | None = None,
     forced_period_ends: pd.DatetimeIndex | None = None,
 ) -> list[int]:
-    if sample_mode == "step":
-        return [i + I - 1 for i in range(0, len(df) - I + 1, sample_step)]
-    if sample_mode != "period_end":
-        raise ValueError("sample_mode must be 'period_end' or 'step'")
 
     dates = pd.to_datetime(df["date"], errors="coerce")
     if forced_period_ends is not None:
@@ -375,7 +365,6 @@ def _candidate_end_indices(
     else:
         period_dates = dates
         period_ends = set(_period_end_dates(period_dates, sample_freq))
-    dates = pd.to_datetime(df["date"], errors="coerce")
     return [
         idx for idx, date in enumerate(dates)
         if idx >= I - 1
@@ -391,7 +380,6 @@ def _build_ticker_samples_from_df(
     I,
     R,
     sample_step,
-    sample_mode,
     sample_freq,
     price_source,
     trading_calendar=None,
@@ -448,14 +436,13 @@ def _build_ticker_samples_from_df(
     target_start = pd.to_datetime(target_start) if target_start is not None else None
     target_end = pd.to_datetime(target_end) if target_end is not None else None
     forced_period_ends = None
-    if trading_calendar is not None and sample_mode == "period_end":
+    if trading_calendar is not None:
         forced_period_ends = _period_end_dates(pd.Series(pd.DatetimeIndex(trading_calendar)), sample_freq)
 
     candidate_end_indices = _candidate_end_indices(
         observed_df,
         I=I,
         sample_step=sample_step,
-        sample_mode=sample_mode,
         sample_freq=sample_freq,
         valid_row_mask=valid_price_row,
         forced_period_ends=forced_period_ends,
@@ -513,7 +500,6 @@ def _build_ticker_samples_from_df(
             "I": I,
             "R": R,
             "sample_step": sample_step,
-            "sample_mode": sample_mode,
             "sample_freq": sample_freq,
             "price_source": price_source,
         })
@@ -528,7 +514,6 @@ def _build_one_ticker_samples(
     I,
     R,
     sample_step,
-    sample_mode,
     sample_freq,
     price_source,
     crsp_data_dir,
@@ -562,7 +547,6 @@ def _build_one_ticker_samples(
         I=I,
         R=R,
         sample_step=sample_step,
-        sample_mode=sample_mode,
         sample_freq=sample_freq,
         price_source=price_source,
         trading_calendar=trading_calendar,
@@ -586,7 +570,6 @@ def _build_crsp_year_samples(
     I,
     R,
     sample_step,
-    sample_mode,
     sample_freq,
     crsp_data_dir,
     crsp_adjusted,
@@ -655,7 +638,6 @@ def _build_crsp_year_samples(
                 I=I,
                 R=R,
                 sample_step=sample_step,
-                sample_mode=sample_mode,
                 sample_freq=sample_freq,
                 price_source="crsp",
                 trading_calendar=trading_calendar,
@@ -690,7 +672,6 @@ def build_research_dataset(
     random_state = 42,
     Market = "TW",
     sample_step = None,
-    sample_mode = "period_end",
     sample_freq = None,
     price_source = "yfinance",
     crsp_data_dir = "us_stock_data",
@@ -743,8 +724,6 @@ def build_research_dataset(
         ma_lags = [] if I == 5 else [I]
     if sample_step < 1:
         raise ValueError("sample_step must be >= 1")
-    if sample_mode not in {"period_end", "step"}:
-        raise ValueError("sample_mode must be 'period_end' or 'step'")
     if max_workers < 1:
         raise ValueError("max_workers must be >= 1")
     if process_by not in {"ticker", "year"}:
@@ -760,7 +739,6 @@ def build_research_dataset(
         I,
         R,
         sample_step=sample_step,
-        sample_mode=sample_mode,
         sample_freq=sample_freq,
     )
     os.makedirs(dataset_dir, exist_ok=True)
@@ -827,7 +805,6 @@ def build_research_dataset(
                 I=I,
                 R=R,
                 sample_step=sample_step,
-                sample_mode=sample_mode,
                 sample_freq=sample_freq,
                 crsp_data_dir=crsp_data_dir,
                 crsp_adjusted=crsp_adjusted,
@@ -862,7 +839,6 @@ def build_research_dataset(
                         I,
                         R,
                         sample_step,
-                        sample_mode,
                         sample_freq,
                         price_source,
                         crsp_data_dir,
@@ -908,7 +884,6 @@ def build_research_dataset(
                     I,
                     R,
                     sample_step,
-                    sample_mode,
                     sample_freq,
                     price_source,
                     crsp_data_dir,
@@ -1008,7 +983,6 @@ def build_research_dataset(
         I=I,
         R=R,
         sample_step=sample_step,
-        sample_mode=sample_mode,
         sample_freq=sample_freq,
         price_source=price_source,
         strict_time_split=strict_time_split,

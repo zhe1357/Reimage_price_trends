@@ -175,8 +175,7 @@ def generate_research_image(
     pixels_per_unit = (price_area_h - 1.0) / (p_max - p_min)
 
     def price_to_row(price):
-        # Match JS_cnn.DrawOHLC.__ret_to_yaxis() exactly, then mirror the row
-        # because JS_cnn flips the PIL canvas at the very end.
+        # 計算價格的相對位置
         y_axis = int(np.around((price - p_min) * pixels_per_unit))
         row = (price_area_h - 1) - y_axis
         return min(max(row, 0), price_area_h - 1)
@@ -192,13 +191,13 @@ def generate_research_image(
         col_right = col_left + 2
 
         draw_candle = np.isfinite(high_draw[i]) and np.isfinite(low_draw[i])
-        if draw_candle:
+        if draw_candle: # K bar
             high_row = price_to_row(high_draw[i])
             low_row = price_to_row(low_draw[i])
             top = min(high_row, low_row)
             bottom = max(high_row, low_row)
             image[top : bottom + 1, col_mid] = 255.0
-
+            # 這邊的高價在低點
         if draw_candle and np.isfinite(open_draw[i]):
             image[price_to_row(open_draw[i]), col_left] = 255.0
 
