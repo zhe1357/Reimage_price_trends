@@ -1,0 +1,18 @@
+{
+  "Market": "US_1993_2020",
+  "dataset_dir": "/home/iof_314707035/Jasper/Reimage_price_trends/data/training_data/US_1993_2020/I5R5S5_week",
+  "I": 5,
+  "R": 5,
+  "seeds": [
+    0
+  ],
+  "epochs": 50,
+  "batch_size": 128,
+  "lr": 0.0005,
+  "weight_decay": 0.0001,
+  "val_ratio": 0.3,
+  "early_stop_patience": 5,
+  "num_workers": 0,
+  "device": "cuda",
+  "tag": "i5r5"
+}

@@ -2,8 +2,10 @@ import os
 import random
 import sys
 from pathlib import Path
+import copy
 
 import numpy as np
+import pandas as pd
 import torch
 import torch.nn as nn
 from sklearn.model_selection import train_test_split
@@ -32,11 +34,6 @@ class CNN_I5(nn.Module):
             nn.LeakyReLU(0.01),
             nn.MaxPool2d((2, 1))
         )
-        
-        # 全連接層：這裡的 16384 需要根據最後輸出的尺寸計算
-        # 32 -> MaxPool -> 16 -> MaxPool -> 8
-        # 15 -> 不變 -> 15 -> 不變 -> 15
-        # 128 * 8 * 15 = 15360
         self.fc = nn.Sequential(
             nn.Flatten(),
             nn.Dropout(0.5),
@@ -232,6 +229,7 @@ def train_one_resplit_model(
     num_workers=0,
     device=None,
     monitor="val_acc",
+    early_stop_patience=5,
 ):
     """
     Train one model with a seed-specific train/val split and initialization.
@@ -256,7 +254,12 @@ def train_one_resplit_model(
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(optimizer, mode="min", patience=5)
 
     best_score = -float("inf") if monitor == "val_acc" else float("inf")
+    best_val_loss = float("inf")
+    best_epoch = 0
+    best_model_state_dict = None
+    no_improve_epochs = 0
     best_path = os.path.join(save_dir, f"{Market}_best_model_I{I}R{R}_seed{seed}.pth")
+    history_path = os.path.join(save_dir, f"{Market}_training_history_I{I}R{R}_seed{seed}.csv")
     history = []
 
     epoch_bar = tqdm(
@@ -290,13 +293,14 @@ def train_one_resplit_model(
             "val_acc": val_acc,
         })
 
-        score = val_acc if monitor == "val_acc" else val_loss
-        improved = score > best_score if monitor == "val_acc" else score < best_score
-        if improved:
-            best_score = score
+        if val_loss < best_val_loss:
+            best_val_loss = val_loss
+            best_epoch = epoch + 1
+            no_improve_epochs = 0
+            best_model_state_dict = copy.deepcopy(model.state_dict())
             torch.save(
                 {
-                    "model_state_dict": model.state_dict(),
+                    "model_state_dict": best_model_state_dict,
                     "I": I,
                     "R": R,
                     "seed": seed,
@@ -307,9 +311,17 @@ def train_one_resplit_model(
                     "epoch": epoch + 1,
                     "train_idx": split_info["train_idx"],
                     "val_idx": split_info["val_idx"],
+                    "history": history,
                 },
                 best_path,
             )
+        else:
+            no_improve_epochs += 1
+
+        score = val_acc if monitor == "val_acc" else val_loss
+        improved = score > best_score if monitor == "val_acc" else score < best_score
+        if improved:
+            best_score = score
 
         epoch_bar.set_postfix(
             train_loss=f"{train_loss:.4f}",
@@ -317,11 +329,43 @@ def train_one_resplit_model(
             val_acc=f"{val_acc * 100:.2f}%",
             best=f"{best_score * 100:.2f}%" if monitor == "val_acc" else f"{best_score:.4f}",
         )
+        if no_improve_epochs >= early_stop_patience:
+            epoch_bar.set_postfix(
+                train_loss=f"{train_loss:.4f}",
+                val_loss=f"{val_loss:.4f}",
+                val_acc=f"{val_acc * 100:.2f}%",
+                early_stop=f"epoch {epoch + 1}",
+            )
+            break
+
+    history_df = pd.DataFrame(history)
+    history_df.to_csv(history_path, index=False, encoding="utf-8-sig")
+
+    summary_path = os.path.join(save_dir, f"{Market}_training_summary_I{I}R{R}_seed{seed}.csv")
+    pd.DataFrame(
+        [
+            {
+                "seed": seed,
+                "best_path": best_path,
+                "history_path": history_path,
+                "best_score": best_score,
+                "best_val_loss": best_val_loss,
+                "best_epoch": best_epoch,
+                "stopped_early": no_improve_epochs >= early_stop_patience,
+                "epochs_ran": len(history),
+            }
+        ]
+    ).to_csv(summary_path, index=False, encoding="utf-8-sig")
 
     return {
         "seed": seed,
         "best_path": best_path,
+        "history_path": history_path,
         "best_score": best_score,
+        "best_val_loss": best_val_loss,
+        "best_epoch": best_epoch,
+        "stopped_early": no_improve_epochs >= early_stop_patience,
+        "best_model_state_dict": best_model_state_dict,
         "history": history,
     }
 
@@ -341,6 +385,7 @@ def train_resplit_ensemble(
     weight_decay=1e-4,
     num_workers=0,
     device=None,
+    early_stop_patience=5,
 ):
     """
     Train multiple models. Each seed uses a different train/val split and
@@ -369,6 +414,7 @@ def train_resplit_ensemble(
             weight_decay=weight_decay,
             num_workers=num_workers,
             device=device,
+            early_stop_patience=early_stop_patience,
         )
         results.append(result)
     return results
