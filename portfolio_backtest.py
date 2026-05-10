@@ -4,6 +4,22 @@ import numpy as np
 import pandas as pd
 
 
+def _infer_periods_per_year(freq=None, R=None):
+    if freq == "week":
+        return 52
+    if freq == "month":
+        return 12
+    if freq == "quarter":
+        return 4
+    if R in {5}:
+        return 52
+    if R in {20, 21, 22}:
+        return 12
+    if R in {60, 65, 66}:
+        return 4
+    return 252 / R if R else 252
+
+
 def make_prediction_frame(meta, y_true, pred_prob, pred_label_threshold=0.5):
     """
     Combine test metadata, true labels, and model probabilities into one table.
@@ -35,28 +51,39 @@ def make_prediction_frame(meta, y_true, pred_prob, pred_label_threshold=0.5):
     return pred_df.sort_values(["date", "ticker"]).reset_index(drop=True)
 
 
-def assign_decile_groups(pred_df, n_groups=10, min_names_per_date=None):
+def assign_decile_groups(pred_df, n_groups=10):
     """
-    Assign stocks into prediction-probability groups for each rebalance date.
+    Assign stocks into JS_cnn-style prediction-probability groups per rebalance date.
 
     Group 1 is the lowest predicted up-probability group.
     Group n_groups is the highest predicted up-probability group.
-    """
-    if min_names_per_date is None:
-        min_names_per_date = n_groups
 
+    JS_cnn cuts directly on raw probability percentiles, rather than ranking first.
+    The first bucket includes its lower bound, while later buckets are open on the
+    lower bound and closed on the upper bound.
+    """
     out = []
     for date, group in pred_df.groupby("date", sort=True):
         group = group.dropna(subset=["pred_prob", "ret"]).copy()
-        if len(group) < min_names_per_date:
+
+        pred_prob = group["pred_prob"]
+        low_decile = np.percentile(pred_prob, 100.0 / n_groups)
+        high_decile = np.percentile(pred_prob, (n_groups - 1) * 100.0 / n_groups)
+        if low_decile == high_decile:
             continue
 
-        ranks = group["pred_prob"].rank(method="first", ascending=True)
-        group["portfolio_group"] = pd.qcut(
-            ranks,
-            q=n_groups,
-            labels=np.arange(1, n_groups + 1),
-        ).astype(int)
+        group["portfolio_group"] = np.nan
+        for decile_idx in range(n_groups):
+            low = np.percentile(pred_prob, decile_idx * 100.0 / n_groups)
+            high = np.percentile(pred_prob, (decile_idx + 1) * 100.0 / n_groups)
+            if decile_idx == 0:
+                mask = (pred_prob >= low) & (pred_prob <= high)
+            else:
+                mask = (pred_prob > low) & (pred_prob <= high)
+            group.loc[mask, "portfolio_group"] = decile_idx + 1
+
+        group = group.dropna(subset=["portfolio_group"]).copy()
+        group["portfolio_group"] = group["portfolio_group"].astype(int)
         out.append(group)
 
     if not out:
@@ -105,15 +132,26 @@ def summarize_strategy_returns(
     return_cols=("long_top_ret", "short_bottom_ret", "long_short_ret"),
     periods_per_year=None,
     R=None,
+    freq=None,
+    annualization="js_cnn",
 ):
     """
     Summarize portfolio performance.
 
-    If periods_per_year is not provided and R is provided, periods_per_year is
-    set to 252 / R, which matches non-overlapping R-day rebalancing.
+    Parameters
+    ----------
+    annualization : {"js_cnn", "compound"}
+        "js_cnn" uses the same simple annualization style as JS_cnn:
+        annualized_return = mean_period_return * periods_per_year
+        Sharpe = annualized_return / annualized_volatility
+
+        "compound" keeps the original Reimage behavior:
+        annualized_return = (1 + mean_period_return) ** periods_per_year - 1
     """
     if periods_per_year is None:
-        periods_per_year = 252 / R if R else 252
+        periods_per_year = _infer_periods_per_year(freq=freq, R=R)
+    if annualization not in {"js_cnn", "compound"}:
+        raise ValueError("annualization must be either 'js_cnn' or 'compound'")
 
     rows = []
     for col in return_cols:
@@ -125,19 +163,31 @@ def summarize_strategy_returns(
 
         mean_period = float(r.mean())
         vol_period = float(r.std(ddof=1))
-        ann_return = float((1.0 + mean_period) ** periods_per_year - 1.0)
+        if annualization == "js_cnn":
+            ann_return = float(mean_period * periods_per_year)
+        else:
+            ann_return = float((1.0 + mean_period) ** periods_per_year - 1.0)
         ann_vol = float(vol_period * np.sqrt(periods_per_year))
-        sharpe = float(mean_period / vol_period * np.sqrt(periods_per_year)) if vol_period > 0 else np.nan
+        sharpe = float(ann_return / ann_vol) if ann_vol > 0 else np.nan
         cumulative_return = float(np.prod(1.0 + r) - 1.0)
+        compound_ann_return = float((1.0 + mean_period) ** periods_per_year - 1.0)
+        compound_sharpe = (
+            float(mean_period / vol_period * np.sqrt(periods_per_year))
+            if vol_period > 0 else np.nan
+        )
 
         rows.append({
             "strategy": col,
             "n_periods": int(len(r)),
+            "periods_per_year": float(periods_per_year),
+            "annualization_method": annualization,
             "mean_period_return": mean_period,
             "period_volatility": vol_period,
             "annualized_return": ann_return,
             "annualized_volatility": ann_vol,
             "sharpe": sharpe,
+            "compound_annualized_return": compound_ann_return,
+            "compound_sharpe": compound_sharpe,
             "cumulative_return": cumulative_return,
             "max_drawdown": _max_drawdown(r),
             "positive_period_rate": float((r > 0).mean()),
@@ -150,7 +200,9 @@ def run_decile_backtest(
     pred_df,
     n_groups=10,
     R=None,
+    freq=None,
     periods_per_year=None,
+    annualization="js_cnn",
     output_dir=None,
     prefix="test",
 ):
@@ -174,6 +226,8 @@ def run_decile_backtest(
         portfolio_returns,
         periods_per_year=periods_per_year,
         R=R,
+        freq=freq,
+        annualization=annualization,
     )
 
     if output_dir is not None:
@@ -195,4 +249,3 @@ def run_decile_backtest(
         )
 
     return grouped_df, portfolio_returns, summary
-

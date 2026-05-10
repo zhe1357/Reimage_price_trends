@@ -76,9 +76,9 @@ class CNN_I20(nn.Module):
 
         # 第三層 (增加深度以處理 20 天的複雜形態)
         self.layer3 = nn.Sequential(
-            nn.Conv2d(128, 256, kernel_size=(3, 3), 
+            nn.Conv2d(128, 256, kernel_size=(5, 3), 
                       stride=(1, 1), 
-                      padding=(1, 1)),
+                      padding=(2, 1)),
             nn.BatchNorm2d(256),
             nn.LeakyReLU(0.01)
         )
