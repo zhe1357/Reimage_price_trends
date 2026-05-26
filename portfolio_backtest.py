@@ -390,7 +390,7 @@ def run_decile_backtest(
 ):
     grouped_df = assign_decile_groups(pred_df, n_groups=n_groups)
     if transaction_cost:
-        grouped_d`f = add_marketcap_from_us_week_ret(
+        grouped_df = add_marketcap_from_us_week_ret(
             grouped_df,
             marketcap_path=marketcap_path,
         )
