@@ -133,9 +133,75 @@ def _fit_pixel_norm(X_train: np.ndarray):
     return mean, std
 
 
-def _apply_pixel_norm(X: np.ndarray, mean: float, std: float):
-    X_float = X.astype(np.float32, copy=False)
-    return ((X_float - mean) / (std + 1e-7)).astype(np.float32, copy=False)
+def _apply_pixel_norm(X: np.ndarray, mean: float = 0.0, std: float = 1.0):
+    return (X.astype(np.float32, copy=False)/255.0 - mean) / (std + 1e-7)
+
+
+def _coerce_years(years, n_samples: int):
+    if years is None:
+        return None
+    if isinstance(years, pd.Series):
+        values = years.to_numpy()
+    else:
+        values = np.asarray(years)
+    if len(values) != n_samples:
+        raise ValueError(f"years length {len(values)} does not match X length {n_samples}")
+    if np.issubdtype(values.dtype, np.datetime64):
+        return pd.to_datetime(values).year.to_numpy(dtype=np.int64)
+    if values.dtype == object:
+        parsed = pd.to_datetime(values, errors="coerce")
+        if parsed.notna().all():
+            return parsed.year.to_numpy(dtype=np.int64)
+    return values.astype(np.int64, copy=False)
+
+
+def _fit_js_cnn_pixel_norm(X: np.ndarray, years=None, max_samples_per_year: int = 50000):
+    X_float = X.astype(np.float32, copy=False) / 255.0
+    years_arr = _coerce_years(years, len(X_float))
+
+    def _one_stat(sample):
+        mean = float(np.mean(sample))
+        std = float(np.std(sample))
+        if std < 1e-7:
+            std = 1.0
+        return {"mean": mean, "std": std}
+
+    if years_arr is None:
+        sample = X_float[: min(max_samples_per_year, len(X_float))]
+        return {"__global__": _one_stat(sample)}
+
+    stats = {}
+    for year in sorted(np.unique(years_arr)):
+        idx = np.flatnonzero(years_arr == year)
+        sample_idx = idx[: min(max_samples_per_year, len(idx))]
+        stats[int(year)] = _one_stat(X_float[sample_idx])
+    return stats
+
+
+def _apply_js_cnn_pixel_norm(X: np.ndarray, years=None, stats=None):
+    
+    X_float = X.astype(np.float32, copy=False) / 255.0
+    years_arr = _coerce_years(years, len(X_float))
+    stats = _fit_js_cnn_pixel_norm(X, years=years_arr) if stats is None else stats
+
+    if "__global__" in stats:
+        mean = float(stats["__global__"]["mean"])
+        std = float(stats["__global__"]["std"])
+        return ((X_float - mean) / (std + 1e-7)).astype(np.float32, copy=False)
+
+    if years_arr is None:
+        raise ValueError("years must be provided when applying per-year JS_cnn normalization")
+
+    out = np.empty_like(X_float, dtype=np.float32)
+    for year in np.unique(years_arr):
+        year_key = int(year)
+        if year_key not in stats:
+            raise KeyError(f"missing JS_cnn normalization stats for year {year_key}")
+        mask = years_arr == year
+        mean = float(stats[year_key]["mean"])
+        std = float(stats[year_key]["std"])
+        out[mask] = (X_float[mask] - mean) / (std + 1e-7)
+    return out
 
 
 def _make_loader(X, y, batch_size=128, shuffle=False, num_workers=0):
@@ -149,6 +215,7 @@ def _make_loader(X, y, batch_size=128, shuffle=False, num_workers=0):
 def make_resplit_dataloaders(
     X_trainval,
     y_trainval,
+    years_trainval=None,
     val_ratio=0.3,
     seed=42,
     batch_size=128,
@@ -164,9 +231,20 @@ def make_resplit_dataloaders(
         stratify=y_trainval,
     )
 
-    mean, std = _fit_pixel_norm(X_trainval[train_idx])
-    X_train_n = _apply_pixel_norm(X_trainval[train_idx], mean, std)
-    X_val_n = _apply_pixel_norm(X_trainval[val_idx], mean, std)
+    years_arr = _coerce_years(years_trainval, len(X_trainval))
+    norm_stats = _fit_js_cnn_pixel_norm(X_trainval, years=years_arr)
+    X_train_n = _apply_js_cnn_pixel_norm(
+        X_trainval[train_idx],
+        years=None if years_arr is None else years_arr[train_idx],
+        stats=norm_stats,
+    )
+    X_val_n = _apply_js_cnn_pixel_norm(
+        X_trainval[val_idx],
+        years=None if years_arr is None else years_arr[val_idx],
+        stats=norm_stats,
+    )
+    mean = float(norm_stats["__global__"]["mean"]) if "__global__" in norm_stats else np.nan
+    std = float(norm_stats["__global__"]["std"]) if "__global__" in norm_stats else np.nan
 
     train_loader = _make_loader(
         X_train_n,
@@ -188,6 +266,8 @@ def make_resplit_dataloaders(
         "val_idx": val_idx,
         "pixel_mean": mean,
         "pixel_std": std,
+        "norm_mode": "js_cnn",
+        "norm_stats": norm_stats,
     }
     return train_loader, val_loader, split_info
 
@@ -219,6 +299,7 @@ def train_one_resplit_model(
     I,
     R,
     seed,
+    years_trainval=None,
     save_dir="models",
     Market="US",
     val_ratio=0.3,
@@ -242,6 +323,7 @@ def train_one_resplit_model(
     train_loader, val_loader, split_info = make_resplit_dataloaders(
         X_trainval,
         y_trainval,
+        years_trainval=years_trainval,
         val_ratio=val_ratio,
         seed=seed,
         batch_size=batch_size,
@@ -306,6 +388,8 @@ def train_one_resplit_model(
                     "seed": seed,
                     "pixel_mean": split_info["pixel_mean"],
                     "pixel_std": split_info["pixel_std"],
+                    "norm_mode": split_info["norm_mode"],
+                    "norm_stats": split_info["norm_stats"],
                     "val_acc": val_acc,
                     "val_loss": val_loss,
                     "epoch": epoch + 1,
@@ -376,6 +460,7 @@ def train_resplit_ensemble(
     I,
     R,
     seeds=(0, 1, 2, 3, 4),
+    years_trainval=None,
     save_dir="models",
     Market="US",
     val_ratio=0.3,
@@ -405,6 +490,7 @@ def train_resplit_ensemble(
             I=I,
             R=R,
             seed=seed,
+            years_trainval=years_trainval,
             save_dir=save_dir,
             Market=Market,
             val_ratio=val_ratio,
@@ -420,7 +506,7 @@ def train_resplit_ensemble(
     return results
 
 
-def predict_proba_from_checkpoint(X, checkpoint_path, batch_size=256, num_workers=0, device=None):
+def predict_proba_from_checkpoint(X, checkpoint_path, batch_size=256, num_workers=0, device=None, years=None):
     """Predict P(label=1) using a saved ensemble checkpoint."""
     device = device or ("cuda" if torch.cuda.is_available() else "cpu")
     try:
@@ -431,7 +517,7 @@ def predict_proba_from_checkpoint(X, checkpoint_path, batch_size=256, num_worker
     model.load_state_dict(checkpoint["model_state_dict"])
     model.eval()
 
-    X_n = _apply_pixel_norm(X, checkpoint["pixel_mean"], checkpoint["pixel_std"])
+    X_n = _apply_js_cnn_pixel_norm(X, years=years, stats=None)
     loader = _make_loader(
         X_n,
         np.zeros(len(X_n), dtype=np.int64),
@@ -450,7 +536,7 @@ def predict_proba_from_checkpoint(X, checkpoint_path, batch_size=256, num_worker
     return np.concatenate(probs)
 
 
-def average_ensemble_predictions(X, checkpoint_paths, batch_size=256, num_workers=0, device=None):
+def average_ensemble_predictions(X, checkpoint_paths, batch_size=256, num_workers=0, device=None, years=None):
     """Average P(label=1) across multiple saved model checkpoints."""
     preds = [
         predict_proba_from_checkpoint(
@@ -459,6 +545,7 @@ def average_ensemble_predictions(X, checkpoint_paths, batch_size=256, num_worker
             batch_size=batch_size,
             num_workers=num_workers,
             device=device,
+            years=years,
         )
         for path in checkpoint_paths
     ]
@@ -483,16 +570,19 @@ def _load_js_mean_std(
     has_ma: bool = True,
     chart_type: str = "bar",
     ohlc_len: int | None = None,
+    sample_freq: str | None = None,
 ):
     _ensure_js_cnn_on_path()
     from Data import dgp_config as dcf
     from Misc import config as cf
 
+    if sample_freq is None:
+        sample_freq = "week" if ws == 5 else "month" if ws == 20 else "quarter"
     ohlc_len = ws if ohlc_len is None else ohlc_len
     ohlc_len_suffix = f"_{ohlc_len}ohlc" if ohlc_len != ws else ""
     chart_suffix = f"_{chart_type}" if chart_type != "bar" else ""
     mean_std_name = (
-        f"mean_std_{ws}dmonth_vb{has_volume_bar}_ma{has_ma}_{year}"
+        f"mean_std_{ws}d{sample_freq}_vb{has_volume_bar}_ma{has_ma}_{year}"
         f"{ohlc_len_suffix}{chart_suffix}.npz"
     )
     mean_std_path = Path(dcf.STOCKS_SAVEPATH) / "stocks_USA" / "dataset_all" / mean_std_name
@@ -546,6 +636,7 @@ def predict_proba_from_js_checkpoint(
     chart_type: str = "bar",
     batch_norm: bool = True,
     drop_prob: float = 0.50,
+    sample_freq: str | None = None,
 ):
     """
     Predict P(label=1) using a JS_cnn checkpoint on Reimage-generated images.
@@ -575,6 +666,7 @@ def predict_proba_from_js_checkpoint(
         has_volume_bar=has_volume_bar,
         has_ma=has_ma,
         chart_type=chart_type,
+        sample_freq=sample_freq,
     )
     X_float = np.asarray(X, dtype=np.float32)
     X_n = ((X_float / 255.0) - mean) / std
@@ -609,6 +701,7 @@ def average_js_cnn_ensemble_predictions(
     chart_type: str = "bar",
     batch_norm: bool = True,
     drop_prob: float = 0.50,
+    sample_freq: str | None = None,
 ):
     preds = [
         predict_proba_from_js_checkpoint(
@@ -624,6 +717,7 @@ def average_js_cnn_ensemble_predictions(
             chart_type=chart_type,
             batch_norm=batch_norm,
             drop_prob=drop_prob,
+            sample_freq=sample_freq,
         )
         for path in checkpoint_paths
     ]

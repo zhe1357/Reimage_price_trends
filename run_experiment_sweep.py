@@ -52,38 +52,51 @@ def _build_run_name(config: dict) -> str:
     return "_".join(parts)
 
 
+def _load_meta(dataset_dir: Path, stem: str):
+    meta_csv = dataset_dir / f"{stem}.csv"
+    meta_feather = dataset_dir / f"{stem}.feather"
+    if meta_csv.exists():
+        meta = pd.read_csv(meta_csv)
+    elif meta_feather.exists():
+        meta = pd.read_feather(meta_feather)
+    else:
+        return None
+
+    for col in ["start_date", "date", "label_end_date"]:
+        if col in meta.columns:
+            meta[col] = pd.to_datetime(meta[col], errors="coerce")
+    return meta
+
+
+def _meta_years(meta: pd.DataFrame | None):
+    if meta is None or "date" not in meta.columns:
+        return None
+    return pd.to_datetime(meta["date"], errors="coerce").dt.year.to_numpy()
+
+
 def _load_dataset(dataset_dir: Path):
     X_trainval = np.load(dataset_dir / "X_trainval.npy")
     y_trainval = np.load(dataset_dir / "y_trainval.npy")
     X_test = np.load(dataset_dir / "X_test.npy")
     y_test = np.load(dataset_dir / "y_test.npy")
 
-    meta_test = None
-    meta_test_csv = dataset_dir / "meta_test.csv"
-    meta_test_feather = dataset_dir / "meta_test.feather"
-    if meta_test_csv.exists():
-        meta_test = pd.read_csv(meta_test_csv)
-    elif meta_test_feather.exists():
-        meta_test = pd.read_feather(meta_test_feather)
+    meta_trainval = _load_meta(dataset_dir, "meta_trainval")
+    meta_test = _load_meta(dataset_dir, "meta_test")
 
-    if meta_test is not None:
-        for col in ["start_date", "date", "label_end_date"]:
-            if col in meta_test.columns:
-                meta_test[col] = pd.to_datetime(meta_test[col], errors="coerce")
-
-    return X_trainval, y_trainval, X_test, y_test, meta_test
+    return X_trainval, y_trainval, X_test, y_test, meta_trainval, meta_test
 
 
 def _save_json(path: Path, payload: dict):
     path.write_text(json.dumps(payload, indent=2, ensure_ascii=False))
 
 
-def _evaluate_ensemble(X_test, y_test, checkpoint_paths, batch_size, device):
+def _evaluate_ensemble(X_test, y_test, checkpoint_paths, batch_size, device, years_test=None):
     pred_prob = model.average_ensemble_predictions(
         X_test,
         checkpoint_paths,
         batch_size=batch_size,
         device=device,
+        years=years_test,
     )
     pred_prob = np.asarray(pred_prob).reshape(-1)
     pred_label = (pred_prob > 0.5).astype(int)
@@ -137,8 +150,10 @@ def run_one_config(
     run_dir = output_root / run_name
     run_dir.mkdir(parents=True, exist_ok=True)
 
-    X_trainval, y_trainval, X_test, y_test, meta_test = _load_dataset(dataset_dir)
+    X_trainval, y_trainval, X_test, y_test, meta_trainval, meta_test = _load_dataset(dataset_dir)
     _save_json(run_dir / "config.json", config)
+    years_trainval = _meta_years(meta_trainval)
+    years_test = _meta_years(meta_test)
 
     results = model.train_resplit_ensemble(
         X_trainval=X_trainval,
@@ -146,6 +161,7 @@ def run_one_config(
         I=I,
         R=R,
         seeds=tuple(seeds),
+        years_trainval=years_trainval,
         save_dir=str(run_dir),
         Market=Market,
         val_ratio=val_ratio,
@@ -191,6 +207,7 @@ def run_one_config(
         checkpoint_paths=checkpoint_paths,
         batch_size=batch_size,
         device=device,
+        years_test=years_test,
     )
 
     prediction_df = pd.DataFrame(

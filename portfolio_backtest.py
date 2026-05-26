@@ -1,4 +1,5 @@
 import os
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
@@ -92,27 +93,203 @@ def assign_decile_groups(pred_df, n_groups=10):
     return pd.concat(out, ignore_index=True)
 
 
-def compute_decile_portfolio_returns(grouped_df, n_groups=10):
+def _find_jasper_root(start=None):
+    start = Path.cwd() if start is None else Path(start)
+    start = start.resolve()
+    for candidate in [start] + list(start.parents):
+        if (candidate / "CACHE_DIR").exists() and (candidate / "Reimage_price_trends").exists():
+            return candidate
+    return None
+
+
+def _default_marketcap_path():
+    jasper_root = _find_jasper_root()
+    if jasper_root is None:
+        return None
+    for name in ("us_week_ret.pq", "us_week_ret.parquet", "us_week_ret.csv"):
+        path = jasper_root / "CACHE_DIR" / name
+        if path.exists():
+            return path
+    return None
+
+
+def add_marketcap_from_us_week_ret(grouped_df, marketcap_path=None):
+    """
+    Add JS_cnn MarketCap to Reimage portfolio assignments.
+
+    The JS_cnn cache uses Date/StockID, while Reimage uses date/ticker.
+    """
+    if grouped_df.empty:
+        return grouped_df.copy()
+
+    if marketcap_path is None:
+        marketcap_path = _default_marketcap_path()
+    if marketcap_path is None:
+        raise FileNotFoundError(
+            "Could not find CACHE_DIR/us_week_ret.pq. Pass marketcap_path explicitly."
+        )
+
+    marketcap_path = Path(marketcap_path)
+    if marketcap_path.suffix.lower() in {".pq", ".parquet"}:
+        marketcap = pd.read_parquet(marketcap_path, columns=["Date", "StockID", "MarketCap"])
+    else:
+        marketcap = pd.read_csv(marketcap_path, usecols=["Date", "StockID", "MarketCap"])
+
+    marketcap = marketcap.rename(
+        columns={"Date": "date", "StockID": "ticker", "MarketCap": "MarketCap"}
+    )
+    marketcap["date"] = pd.to_datetime(marketcap["date"], errors="coerce")
+    marketcap["ticker"] = marketcap["ticker"].astype(str)
+    marketcap["MarketCap"] = pd.to_numeric(marketcap["MarketCap"], errors="coerce").abs()
+    marketcap = marketcap.dropna(subset=["date", "ticker", "MarketCap"])
+    marketcap = marketcap.drop_duplicates(subset=["date", "ticker"], keep="last")
+
+    out = grouped_df.copy()
+    out["date"] = pd.to_datetime(out["date"], errors="coerce")
+    out["ticker"] = out["ticker"].astype(str)
+    out = out.drop(columns=["MarketCap"], errors="ignore")
+    return out.merge(marketcap, on=["date", "ticker"], how="left")
+
+
+def _assign_marketcap_transaction_bps(
+    grouped_df,
+    base_bps=1.0,
+    mid_bps=5.0,
+    small_bps=10.0,
+    large_quantile=0.8,
+    mid_quantile=0.4,
+):
+    """
+    Assign one-way transaction-cost bps by date-level MarketCap ranks.
+
+    Larger stocks get base_bps, middle stocks get mid_bps, and smaller stocks get
+    small_bps. Missing MarketCap falls back to small_bps.
+    """
+    out = grouped_df.copy()
+    if "MarketCap" not in out.columns:
+        out["transaction_cost_bps"] = float(base_bps)
+        return out
+
+    out["MarketCap"] = pd.to_numeric(out["MarketCap"], errors="coerce").abs()
+    cap_rank = out.groupby("date")["MarketCap"].rank(pct=True)
+    out["transaction_cost_bps"] = np.select(
+        [
+            cap_rank >= large_quantile,
+            cap_rank >= mid_quantile,
+        ],
+        [
+            float(base_bps),
+            float(mid_bps),
+        ],
+        default=float(small_bps),
+    )
+    out.loc[out["MarketCap"].isna(), "transaction_cost_bps"] = float(small_bps)
+    return out
+
+
+def _membership_rebalance_cost(sub, prev_assets, one_way_bps):
+    """
+    Compute membership-based rebalance cost for an equal-weight long portfolio.
+
+    Stocks that remain in the group are not charged. Newly bought and sold names
+    are charged by their equal-weight notional share.
+    """
+    curr_assets = set(sub["ticker"].astype(str))
+    if len(curr_assets) == 0:
+        return 0.0, 0.0, curr_assets
+
+    if prev_assets is None:
+        bought = curr_assets
+        sold = set()
+    else:
+        bought = curr_assets - prev_assets
+        sold = prev_assets - curr_assets
+
+    curr_size = len(curr_assets)
+    prev_size = len(prev_assets) if prev_assets else curr_size
+    bought_weight = len(bought) / curr_size if curr_size else 0.0
+    sold_weight = len(sold) / prev_size if prev_size else 0.0
+
+    cost_lookup = (
+        sub.assign(ticker=sub["ticker"].astype(str))
+        .set_index("ticker")["transaction_cost_bps"]
+        .to_dict()
+    )
+    default_bps = float(pd.to_numeric(sub["transaction_cost_bps"], errors="coerce").median())
+    if not np.isfinite(default_bps):
+        default_bps = float(one_way_bps)
+
+    bought_cost = sum(cost_lookup.get(ticker, default_bps) / 10000.0 for ticker in bought)
+    sold_cost = len(sold) * (default_bps / 10000.0)
+    cost = bought_cost / curr_size
+    if prev_size:
+        cost += sold_cost / prev_size
+    turnover = bought_weight + sold_weight
+    return float(cost), float(turnover), curr_assets
+
+
+def compute_decile_portfolio_returns(
+    grouped_df,
+    n_groups=10,
+    transaction_cost=False,
+    transaction_cost_bps=1.0,
+    mid_cap_transaction_cost_bps=5.0,
+    small_cap_transaction_cost_bps=10.0,
+):
     """
     Compute equal-weight decile returns by rebalance date.
 
     Returns one row per date with group_1_ret ... group_10_ret, plus
-    long_top_ret, short_bottom_ret, and long_short_ret.
+    long_top_ret, short_bottom_ret, and long_short_ret. When transaction_cost is
+    True, net return, turnover, and transaction-cost columns are also included.
     """
     if grouped_df.empty:
         return pd.DataFrame()
+
+    if transaction_cost and "transaction_cost_bps" not in grouped_df.columns:
+        grouped_df = _assign_marketcap_transaction_bps(
+            grouped_df,
+            base_bps=transaction_cost_bps,
+            mid_bps=mid_cap_transaction_cost_bps,
+            small_bps=small_cap_transaction_cost_bps,
+        )
+    prev_assets_by_group = {group_id: None for group_id in range(1, n_groups + 1)}
 
     rows = []
     for date, group in grouped_df.groupby("date", sort=True):
         row = {"date": date}
         for group_id in range(1, n_groups + 1):
             sub = group[group["portfolio_group"] == group_id]
-            row[f"group_{group_id}_ret"] = float(sub["ret"].mean()) if len(sub) else np.nan
+            gross_ret = float(sub["ret"].mean()) if len(sub) else np.nan
+            row[f"group_{group_id}_ret"] = gross_ret
             row[f"group_{group_id}_n"] = int(len(sub))
+            if transaction_cost:
+                cost, turnover, curr_assets = _membership_rebalance_cost(
+                    sub,
+                    prev_assets_by_group[group_id],
+                    transaction_cost_bps,
+                )
+                prev_assets_by_group[group_id] = curr_assets
+                row[f"group_{group_id}_transaction_cost"] = cost
+                row[f"group_{group_id}_turnover"] = turnover
+                row[f"group_{group_id}_net_ret"] = (
+                    gross_ret - cost if np.isfinite(gross_ret) else np.nan
+                )
 
         row["short_bottom_ret"] = -row["group_1_ret"]
         row["long_top_ret"] = row[f"group_{n_groups}_ret"]
         row["long_short_ret"] = row["long_top_ret"] - row["group_1_ret"]
+        if transaction_cost:
+            row["short_bottom_net_ret"] = -row["group_1_net_ret"]
+            row["long_top_net_ret"] = row[f"group_{n_groups}_net_ret"]
+            row["long_short_net_ret"] = row["long_top_net_ret"] - row["group_1_net_ret"]
+            row["long_short_transaction_cost"] = (
+                row[f"group_{n_groups}_transaction_cost"]
+                + row["group_1_transaction_cost"]
+            )
+            row["long_short_turnover"] = (
+                row[f"group_{n_groups}_turnover"] + row["group_1_turnover"]
+            )
         row["n_stocks"] = int(len(group))
         rows.append(row)
 
@@ -205,25 +382,42 @@ def run_decile_backtest(
     annualization="js_cnn",
     output_dir=None,
     prefix="test",
+    transaction_cost=False,
+    transaction_cost_bps=1.0,
+    mid_cap_transaction_cost_bps=5.0,
+    small_cap_transaction_cost_bps=10.0,
+    marketcap_path=None,
 ):
-    """
-    Run a 10-group prediction-sorted portfolio backtest.
-
-    The strategy:
-    - each prediction date, sort stocks by pred_prob
-    - split into n_groups equal-count groups
-    - long the highest-probability group
-    - short the lowest-probability group
-    - use equal-weight future R-day returns from the `ret` column
-
-    Returns
-    -------
-    grouped_df, portfolio_returns, summary
-    """
     grouped_df = assign_decile_groups(pred_df, n_groups=n_groups)
-    portfolio_returns = compute_decile_portfolio_returns(grouped_df, n_groups=n_groups)
+    if transaction_cost:
+        grouped_d`f = add_marketcap_from_us_week_ret(
+            grouped_df,
+            marketcap_path=marketcap_path,
+        )
+        grouped_df = _assign_marketcap_transaction_bps(
+            grouped_df,
+            base_bps=transaction_cost_bps,
+            mid_bps=mid_cap_transaction_cost_bps,
+            small_bps=small_cap_transaction_cost_bps,
+        )
+    portfolio_returns = compute_decile_portfolio_returns(
+        grouped_df,
+        n_groups=n_groups,
+        transaction_cost=transaction_cost,
+        transaction_cost_bps=transaction_cost_bps,
+        mid_cap_transaction_cost_bps=mid_cap_transaction_cost_bps,
+        small_cap_transaction_cost_bps=small_cap_transaction_cost_bps,
+    )
+    return_cols = ("long_top_ret", "short_bottom_ret", "long_short_ret")
+    if transaction_cost:
+        return_cols = return_cols + (
+            "long_top_net_ret",
+            "short_bottom_net_ret",
+            "long_short_net_ret",
+        )
     summary = summarize_strategy_returns(
         portfolio_returns,
+        return_cols=return_cols,
         periods_per_year=periods_per_year,
         R=R,
         freq=freq,

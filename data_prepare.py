@@ -305,15 +305,66 @@ def get_dataset_output_dir(
 
 
 def _forward_return(df: pd.DataFrame, R: int, price_source: str) -> pd.Series:
-    """Compute future R-day return for labels."""
-    if price_source == "crsp" and "ret" in df.columns:
-        gross = 1.0 + pd.to_numeric(df["ret"], errors="coerce")
-        future_gross = pd.Series(1.0, index=df.index, dtype=float)
-        for k in range(1, R + 1):
-            future_gross = future_gross * gross.shift(-k)
-        return future_gross - 1.0
+    """Compute future R-observed-row return for non-period-end datasets."""
+    if R < 1:
+        raise ValueError("R must be a positive integer")
 
-    return df["close"].pct_change(R).shift(-R)
+    if price_source == "crsp" and "ret" in df.columns:
+        ret = pd.to_numeric(df["ret"], errors="coerce")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            log_ret = np.log1p(ret)
+        log_ret = log_ret.where(np.isfinite(log_ret))
+        cum_log_ret = log_ret.cumsum(skipna=True)
+        return np.expm1(cum_log_ret.shift(-R) - cum_log_ret)
+
+    close = pd.to_numeric(df["close"], errors="coerce")
+    with np.errstate(divide="ignore", invalid="ignore"):
+        log_close = np.log(close.where(close > 0))
+    return np.expm1(log_close.shift(-R) - log_close)
+
+
+def _period_end_forward_return(
+    df: pd.DataFrame,
+    sample_freq: str,
+    price_source: str,
+    period_end_dates: pd.DatetimeIndex,
+) -> pd.DataFrame:
+    """Compute JS_cnn-style period-end to next-period-end future returns.
+
+    JS_cnn builds weekly/monthly/quarterly returns only on market period-end
+    dates. For each stock, the return at period end t is:
+    expm1(cum_log_ret(next period end) - cum_log_ret(t)).
+    """
+    if sample_freq not in {"week", "month", "quarter"}:
+        raise ValueError("sample_freq must be 'week', 'month', or 'quarter'")
+
+    dates = pd.to_datetime(df["date"], errors="coerce")
+    period_end_dates = pd.DatetimeIndex(period_end_dates)
+    period_mask = dates.isin(period_end_dates)
+
+    if price_source == "crsp" and "ret" in df.columns:
+        ret = pd.to_numeric(df["ret"], errors="coerce")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            log_ret = np.log1p(ret)
+        log_ret = log_ret.where(np.isfinite(log_ret))
+        cum_value = log_ret.cumsum(skipna=True)
+    else:
+        close = pd.to_numeric(df["close"], errors="coerce")
+        with np.errstate(divide="ignore", invalid="ignore"):
+            cum_value = np.log(close.where(close > 0))
+
+    period_idx = df.index[period_mask]
+    period_cum = cum_value.loc[period_idx]
+    next_period_cum = period_cum.shift(-1)
+    next_period_date = dates.loc[period_idx].shift(-1)
+
+    out = pd.DataFrame(index=df.index)
+    out["ret"] = np.nan
+    out["label_end_date"] = pd.NaT
+    period_ret = np.expm1(next_period_cum - cum_value.loc[period_idx])
+    out.loc[period_idx, "ret"] = pd.to_numeric(period_ret, errors="coerce").to_numpy(dtype=float)
+    out.loc[period_idx, "label_end_date"] = pd.to_datetime(next_period_date, errors="coerce")
+    return out
 
 
 def _infer_sample_freq(R: int) -> str:
@@ -413,10 +464,24 @@ def _build_ticker_samples_from_df(
     if df.empty:
         return ticker_key, images, labels, meta, "no valid dates"
 
-    # Compute labels on observed ticker rows before reindexing to the market
-    # calendar. Otherwise inserted calendar-only gaps turn multi-day CRSP
-    # returns into NaN and can wipe out every sample in sparse histories.
-    df[f"ret{R}"] = _forward_return(df, R, price_source)
+    forced_period_ends = None
+    if trading_calendar is not None:
+        forced_period_ends = _period_end_dates(pd.Series(pd.DatetimeIndex(trading_calendar)), sample_freq)
+    else:
+        forced_period_ends = _period_end_dates(df["date"], sample_freq)
+
+    # Compute JS_cnn-style labels on observed ticker rows: period end t to the
+    # next available period end for the same stock. This keeps all stocks in a
+    # rebalance date on the same market frequency instead of using R observed
+    # ticker rows, which can drift when a stock has missing trading days.
+    period_return = _period_end_forward_return(
+        df,
+        sample_freq=sample_freq,
+        price_source=price_source,
+        period_end_dates=forced_period_ends,
+    )
+    df[f"ret{R}"] = period_return["ret"]
+    df["label_end_date"] = period_return["label_end_date"]
     df["label"] = (df[f"ret{R}"] > 0).where(df[f"ret{R}"].notna(), np.nan)
 
     observed_df = df.reset_index(drop=True).copy()
@@ -430,14 +495,11 @@ def _build_ticker_samples_from_df(
     first_valid_idx = int(valid_indices[0])
     last_valid_idx = int(valid_indices[-1])
 
-    if len(observed_df) < I + R + 5:
+    if len(observed_df) < I + 1:
         return ticker_key, images, labels, meta, "not enough rows"
 
     target_start = pd.to_datetime(target_start) if target_start is not None else None
     target_end = pd.to_datetime(target_end) if target_end is not None else None
-    forced_period_ends = None
-    if trading_calendar is not None:
-        forced_period_ends = _period_end_dates(pd.Series(pd.DatetimeIndex(trading_calendar)), sample_freq)
 
     candidate_end_indices = _candidate_end_indices(
         observed_df,
@@ -453,7 +515,7 @@ def _build_ticker_samples_from_df(
 
     ma_offset = 0 if ma_lags is None else max([int(lag) for lag in ma_lags], default=0)
     for end_idx in iterator:
-        if end_idx > last_valid_idx or end_idx + R >= len(observed_df):
+        if end_idx > last_valid_idx:
             continue
         if not valid_price_row.iloc[end_idx]:
             continue
@@ -476,7 +538,9 @@ def _build_ticker_samples_from_df(
 
         label = int(observed_df.iloc[end_idx]["label"])
         start_date = window.iloc[-I]["date"]
-        label_end_date = observed_df.iloc[end_idx + R]["date"]
+        label_end_date = observed_df.iloc[end_idx]["label_end_date"]
+        if pd.isna(label_end_date):
+            continue
 
         try:
             img = generate_research_image(
@@ -1001,7 +1065,7 @@ def build_research_dataset(
         y_te=y_te,
     )
 
-    print(f"\n撌脣摮 {dataset_dir}/")
+    print(f"\nDataset saved to {dataset_dir}/")
     return X_tv, y_tv, X_te, y_te, meta_df
 
 
